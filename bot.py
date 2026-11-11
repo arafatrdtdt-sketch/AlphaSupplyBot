@@ -45,8 +45,7 @@ def is_admin(uid):
 
 
 def btn(text, callback_data=None, url=None, style=None):
-    """Build a dict-format button (supports Telegram button colors).
-    style: 'success' = green, 'primary' = blue, 'danger' = red"""
+    """Inline button with optional color: success(green)/primary(blue)/danger(red)."""
     b = {"text": str(text)}
     if callback_data:
         b["callback_data"] = callback_data
@@ -80,22 +79,30 @@ async def ensure_user(tg_user):
     return r.data[0]
 
 
+# -------- Main menu labels --------
 MENU_BUY = "🛒 Buy Items"
-MENU_PROFILE = "👤 Profile"
 MENU_BALANCE = "💰 Add Balance"
+MENU_PROFILE = "👤 Profile"
 MENU_HISTORY = "📜 History"
 MENU_SUPPORT = "🆘 Support"
 MENU_ADMIN = "⚙️ Admin Panel"
-MENU_BUTTONS = {MENU_BUY, MENU_PROFILE, MENU_BALANCE, MENU_HISTORY, MENU_SUPPORT, MENU_ADMIN}
+MENU_BUTTONS = {MENU_BUY, MENU_BALANCE, MENU_PROFILE, MENU_HISTORY, MENU_SUPPORT, MENU_ADMIN}
+
+# -------- Admin menu labels --------
+ADM_ADD_PROD = "➕ Add Product"
+ADM_ADD_STOCK = "📦 Add Stock"
+ADM_TOPUPS = "💳 Pending Topups"
+ADM_STATS = "📊 Stats"
+ADM_BACK = "⬅️ Back to Main Menu"
+ADMIN_BUTTONS = {ADM_ADD_PROD, ADM_ADD_STOCK, ADM_TOPUPS, ADM_STATS, ADM_BACK}
 
 
 def main_menu(admin: bool = False):
     """
-    Layout (2↔3 swapped, colored):
-      Row 1: 🛒 Buy Items (green)   | 💰 Add Balance (green)
-      Row 2: 👤 Profile (blue)     | 📜 History (blue)
-      Row 3: 🆘 Support (red)
-      Row 4: ⚙️ Admin Panel (red)  — admin only
+    Row 1: 🛒 Buy Items (green)   | 💰 Add Balance (green)
+    Row 2: 👤 Profile (blue)     | 📜 History (blue)
+    Row 3: 🆘 Support (red)
+    Row 4: ⚙️ Admin Panel (red)  — admin only
     """
     kb = [
         [{"text": MENU_BUY, "style": "success"}, {"text": MENU_BALANCE, "style": "success"}],
@@ -107,9 +114,24 @@ def main_menu(admin: bool = False):
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
+def admin_menu():
+    """
+    Row 1: ➕ Add Product (green)  | 📦 Add Stock (blue)
+    Row 2: 💳 Pending Topups (blue) | 📊 Stats (blue)
+    Row 3: ⬅️ Back to Main Menu (red)
+    """
+    kb = [
+        [{"text": ADM_ADD_PROD, "style": "success"}, {"text": ADM_ADD_STOCK, "style": "primary"}],
+        [{"text": ADM_TOPUPS, "style": "primary"}, {"text": ADM_STATS, "style": "primary"}],
+        [{"text": ADM_BACK, "style": "danger"}],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+
 # ---------------- user handlers ----------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update.effective_user)
+    ctx.user_data["in_admin"] = False
     await update.message.reply_text(
         "👋 <b>Welcome to AlphaSupply!</b>\n\n"
         "Buy VPN, Proxy, Mail accounts with instant delivery.\n\n"
@@ -121,6 +143,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
+    ctx.user_data["in_admin"] = False
     await update.message.reply_text(
         "Cancelled.",
         reply_markup=main_menu(is_admin(update.effective_user.id)),
@@ -161,7 +184,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )])
     kb.append([btn("⬅️ Back", callback_data="back_cats", style="danger")])
     await q.edit_message_text(
-        f"📦 Please Select a <b>{html.escape(cat.title())}</b>",
+        f"📦 <b>{html.escape(cat.title())}</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -358,30 +381,81 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# ---------------- admin ----------------
+# ---------------- admin (text-menu driven) ----------------
 async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point: switches reply keyboard to admin control menu."""
     if not is_admin(update.effective_user.id):
         return
-    kb = [
-        [btn("➕ Add Product", callback_data="adm:addprod", style="success")],
-        [btn("📦 Add Stock", callback_data="adm:addstock", style="primary")],
-        [btn("💳 Pending Topups", callback_data="adm:topups", style="primary")],
-        [btn("📊 Stats", callback_data="adm:stats", style="primary")],
-    ]
+    ctx.user_data["in_admin"] = True
     await update.message.reply_text(
-        "⚙️ <b>Admin Panel</b>",
+        "⚙️ <b>Admin Panel</b>\n\nChoose an option from the menu below:",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=admin_menu(),
     )
 
 
-async def adm_addprod_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def adm_btn_addprod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["state"] = "adm_prod_name"
-    await q.edit_message_text("Send product <b>name</b>:", parse_mode="HTML")
+    await update.message.reply_text("Send product <b>name</b>:", parse_mode="HTML")
 
 
+async def adm_btn_addstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    r = await sb(supabase.table("products").select("id,name,stock").order("id"))
+    products = r.data or []
+    if not products:
+        await update.message.reply_text(
+            "No products yet. Add a product first.",
+            reply_markup=admin_menu(),
+        )
+        return
+    kb = [[btn(f"{p['name']} (stock: {p['stock']})", callback_data=f"stk:{p['id']}", style="primary")] for p in products]
+    await update.message.reply_text("Select product to add stock:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def adm_btn_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    r = await sb(supabase.table("topup_requests").select("*").eq("status", "pending").order("id"))
+    reqs = r.data or []
+    if not reqs:
+        await update.message.reply_text("No pending topups.", reply_markup=admin_menu())
+        return
+    await update.message.reply_text(f"⏳ {len(reqs)} pending topup(s):", reply_markup=admin_menu())
+    for req in reqs:
+        kb = InlineKeyboardMarkup([[
+            btn("✅ Approve", callback_data=f"tup:ok:{req['id']}", style="success"),
+            btn("❌ Reject", callback_data=f"tup:no:{req['id']}", style="danger"),
+        ]])
+        await update.message.reply_text(
+            f"<b>Topup #{req['id']}</b>\n"
+            f"User: <code>{req['user_id']}</code>\n"
+            f"Amount: {req['amount']} {CURRENCY}\n"
+            f"TrxID: <code>{html.escape(str(req['txn_id']))}</code>\n"
+            f"Date: {(req.get('created_at') or '')[:16].replace('T', ' ')}",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+
+async def adm_btn_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    u = await sb(supabase.table("users").select("id", count="exact"))
+    p = await sb(supabase.table("products").select("id", count="exact").eq("is_active", True))
+    o = await sb(supabase.table("orders").select("id", count="exact"))
+    tp = await sb(supabase.table("topup_requests").select("id", count="exact").eq("status", "pending"))
+    await update.message.reply_text(
+        f"📊 <b>Stats</b>\n\n"
+        f"👥 Users: {u.count or 0}\n"
+        f"📦 Products: {p.count or 0}\n"
+        f"🛒 Orders: {o.count or 0}\n"
+        f"⏳ Pending Topups: {tp.count or 0}",
+        parse_mode="HTML",
+        reply_markup=admin_menu(),
+    )
+
+
+# ---- Add Product flow (conversation via state) ----
 async def adm_addprod_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["p_name"] = update.message.text.strip()
     ctx.user_data["state"] = "adm_prod_cat"
@@ -422,22 +496,11 @@ async def adm_addprod_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Product added: <b>{html.escape(data['name'])}</b>\n"
         f"Use 📦 Add Stock to add deliverable items.",
         parse_mode="HTML",
-        reply_markup=main_menu(True),
+        reply_markup=admin_menu(),
     )
 
 
-async def adm_addstock_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    r = await sb(supabase.table("products").select("id,name,stock").order("id"))
-    products = r.data or []
-    if not products:
-        await q.edit_message_text("No products yet. Add a product first.")
-        return
-    kb = [[btn(f"{p['name']} (stock: {p['stock']})", callback_data=f"stk:{p['id']}", style="primary")] for p in products]
-    await q.edit_message_text("Select product to add stock:", reply_markup=InlineKeyboardMarkup(kb))
-
-
+# ---- Add Stock flow ----
 async def adm_addstock_prod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -454,11 +517,11 @@ async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pid = ctx.user_data.pop("stock_pid", None)
     ctx.user_data.pop("state", None)
     if not pid:
-        await update.message.reply_text("Session lost. Try again.")
+        await update.message.reply_text("Session lost. Try again.", reply_markup=admin_menu())
         return
     lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
     if not lines:
-        await update.message.reply_text("No items received.", reply_markup=main_menu(True))
+        await update.message.reply_text("No items received.", reply_markup=admin_menu())
         return
     await sb(supabase.table("product_items").insert([{"product_id": pid, "content": l} for l in lines]))
     r = await sb(supabase.table("product_items").select("id", count="exact").eq("product_id", pid).eq("is_sold", False))
@@ -467,38 +530,11 @@ async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Added <b>{len(lines)}</b> items. New stock: <b>{new_stock}</b>",
         parse_mode="HTML",
-        reply_markup=main_menu(True),
+        reply_markup=admin_menu(),
     )
 
 
-async def adm_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    r = await sb(supabase.table("topup_requests").select("*").eq("status", "pending").order("id"))
-    reqs = r.data or []
-    if not reqs:
-        await q.edit_message_text("No pending topups.")
-        return
-    await q.edit_message_text(f"⏳ {len(reqs)} pending topup(s). Sending below...")
-    for req in reqs:
-        kb = InlineKeyboardMarkup([[
-            btn("✅ Approve", callback_data=f"tup:ok:{req['id']}", style="success"),
-            btn("❌ Reject", callback_data=f"tup:no:{req['id']}", style="danger"),
-        ]])
-        await ctx.bot.send_message(
-            q.from_user.id,
-            f"<b>Topup #{req['id']}</b>\n"
-            f"User: <code>{req['user_id']}</code>\n"
-            f"Amount: {req['amount']} {CURRENCY}\n"
-            f"TrxID: <code>{html.escape(str(req['txn_id']))}</code>\n"
-            f"Date: {(req.get('created_at') or '')[:16].replace('T', ' ')}",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-
-
+# ---- Topup approve/reject ----
 async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -528,46 +564,51 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Rejected.")
 
 
-async def adm_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    u = await sb(supabase.table("users").select("id", count="exact"))
-    p = await sb(supabase.table("products").select("id", count="exact").eq("is_active", True))
-    o = await sb(supabase.table("orders").select("id", count="exact"))
-    tp = await sb(supabase.table("topup_requests").select("id", count="exact").eq("status", "pending"))
-    await q.edit_message_text(
-        f"📊 <b>Stats</b>\n\n"
-        f"👥 Users: {u.count or 0}\n"
-        f"📦 Products: {p.count or 0}\n"
-        f"🛒 Orders: {o.count or 0}\n"
-        f"⏳ Pending Topups: {tp.count or 0}",
-        parse_mode="HTML",
-    )
-
-
 # ---------------- router ----------------
 async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     state = ctx.user_data.get("state")
+    user_is_admin = is_admin(update.effective_user.id)
 
+    # 1) Admin text-menu buttons (only for admins)
+    if text in ADMIN_BUTTONS and user_is_admin:
+        ctx.user_data.pop("state", None)
+        if text == ADM_ADD_PROD:
+            return await adm_btn_addprod(update, ctx)
+        if text == ADM_ADD_STOCK:
+            return await adm_btn_addstock(update, ctx)
+        if text == ADM_TOPUPS:
+            return await adm_btn_topups(update, ctx)
+        if text == ADM_STATS:
+            return await adm_btn_stats(update, ctx)
+        if text == ADM_BACK:
+            ctx.user_data["in_admin"] = False
+            return await update.message.reply_text(
+                "⬅️ Returned to Main Menu.",
+                reply_markup=main_menu(user_is_admin),
+            )
+        return
+
+    # 2) Main menu buttons
     if text in MENU_BUTTONS:
         ctx.user_data.pop("state", None)
+        if text == MENU_ADMIN:
+            return await admin_panel(update, ctx)
+        # any other main menu item exits admin mode
+        ctx.user_data["in_admin"] = False
         if text == MENU_BUY:
             return await show_categories(update, ctx)
-        if text == MENU_PROFILE:
-            return await show_profile(update, ctx)
         if text == MENU_BALANCE:
             return await start_topup(update, ctx)
+        if text == MENU_PROFILE:
+            return await show_profile(update, ctx)
         if text == MENU_HISTORY:
             return await show_history(update, ctx)
         if text == MENU_SUPPORT:
             return await show_support(update, ctx)
-        if text == MENU_ADMIN:
-            return await admin_panel(update, ctx)
         return
 
+    # 3) Conversation states
     if state == "topup_amount":
         return await topup_amount_handler(update, ctx)
     if state == "topup_txn":
@@ -583,10 +624,9 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state == "adm_stock_items":
         return await adm_addstock_items(update, ctx)
 
-    await update.message.reply_text(
-        "Unknown option. Use the menu.",
-        reply_markup=main_menu(is_admin(update.effective_user.id)),
-    )
+    # 4) Fallback — pick correct keyboard
+    kb = admin_menu() if (user_is_admin and ctx.user_data.get("in_admin")) else main_menu(user_is_admin)
+    await update.message.reply_text("Unknown option. Use the menu.", reply_markup=kb)
 
 
 # ---------------- healthcheck ----------------
@@ -618,12 +658,9 @@ async def main():
     app.add_handler(CallbackQueryHandler(back_cats, pattern="^back_cats$"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
 
-    app.add_handler(CallbackQueryHandler(adm_addprod_start, pattern="^adm:addprod$"))
-    app.add_handler(CallbackQueryHandler(adm_addstock_start, pattern="^adm:addstock$"))
+    # admin inline actions (stock select + topup approve/reject)
     app.add_handler(CallbackQueryHandler(adm_addstock_prod, pattern="^stk:"))
-    app.add_handler(CallbackQueryHandler(adm_topups, pattern="^adm:topups$"))
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
-    app.add_handler(CallbackQueryHandler(adm_stats, pattern="^adm:stats$"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
 
