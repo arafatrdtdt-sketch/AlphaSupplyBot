@@ -284,9 +284,9 @@ def build_quantity_view(product, qty):
     else:
         kb = [
             [
-                btn("➖", callback_data=f"qty:dec:{product['id']}:{qty}", style="danger"),
-                btn(f"🔢 {qty}", callback_data=f"qty:info:{product['id']}", style="success"),
-                btn("➕", callback_data=f"qty:inc:{product['id']}:{qty}", style="primary"),
+                btn("-", callback_data=f"qty:dec:{product['id']}:{qty}", style="danger"),
+                btn(f"🛒 {qty}", callback_data=f"qty:info:{product['id']}", style="success"),
+                btn("+", callback_data=f"qty:inc:{product['id']}:{qty}", style="primary"),
             ],
             [btn("✏️ Enter Quantity Manually", callback_data=f"qty:manual:{product['id']}", style="primary")],
             [btn("✅ Confirm & Buy", callback_data=f"qty:buy:{product['id']}:{qty}", style="success")],
