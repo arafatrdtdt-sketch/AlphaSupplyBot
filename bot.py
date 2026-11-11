@@ -34,15 +34,20 @@ if not (BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY):
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
 # ---------------- helpers ----------------
 async def sb(q):
     return await asyncio.to_thread(q.execute)
 
-def is_admin(uid): return uid in ADMIN_IDS
+
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
 
 async def get_user(uid):
     r = await sb(supabase.table("users").select("*").eq("id", uid).limit(1))
     return r.data[0] if r.data else None
+
 
 async def ensure_user(tg_user):
     u = await get_user(tg_user.id)
@@ -61,6 +66,7 @@ async def ensure_user(tg_user):
     }))
     return r.data[0]
 
+
 MENU_BUY = "🛒 Buy Items"
 MENU_PROFILE = "👤 Profile"
 MENU_BALANCE = "💰 Add Balance"
@@ -68,6 +74,7 @@ MENU_HISTORY = "📜 History"
 MENU_SUPPORT = "🆘 Support"
 MENU_ADMIN = "⚙️ Admin Panel"
 MENU_BUTTONS = {MENU_BUY, MENU_PROFILE, MENU_BALANCE, MENU_HISTORY, MENU_SUPPORT, MENU_ADMIN}
+
 
 def main_menu(admin: bool = False):
     kb = [
@@ -79,16 +86,18 @@ def main_menu(admin: bool = False):
         kb.append([KeyboardButton(MENU_ADMIN)])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
+
 # ---------------- user handlers ----------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update.effective_user)
     await update.message.reply_text(
-        "👋 *Welcome to AlphaSupply!*\n\n"
+        "👋 <b>Welcome to AlphaSupply!</b>\n\n"
         "Buy VPN, Proxy, Mail accounts with instant delivery.\n\n"
         "Use the menu below to get started.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=main_menu(is_admin(update.effective_user.id)),
     )
+
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
@@ -96,6 +105,7 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Cancelled.",
         reply_markup=main_menu(is_admin(update.effective_user.id)),
     )
+
 
 async def show_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     r = await sb(supabase.table("products").select("category").eq("is_active", True))
@@ -105,9 +115,11 @@ async def show_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     kb = [[InlineKeyboardButton(f"📦 {c.title()}", callback_data=f"cat:{c}")] for c in cats]
     await update.message.reply_text(
-        "🛒 *Select a category:*", parse_mode="Markdown",
+        "🛒 <b>Select a category:</b>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
+
 
 async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -116,7 +128,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     r = await sb(supabase.table("products").select("*").eq("category", cat).eq("is_active", True))
     products = r.data or []
     if not products:
-        await q.edit_message_text(f"No products in {cat}.")
+        await q.edit_message_text(f"No products in {html.escape(cat)}.")
         return
     kb = []
     for p in products:
@@ -127,9 +139,11 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )])
     kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_cats")])
     await q.edit_message_text(
-        f"📦 *{cat.title()}*", parse_mode="Markdown",
+        f"📦 <b>{html.escape(cat.title())}</b>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
+
 
 async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -138,9 +152,11 @@ async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cats = sorted({row["category"] for row in (r.data or [])})
     kb = [[InlineKeyboardButton(f"📦 {c.title()}", callback_data=f"cat:{c}")] for c in cats]
     await q.edit_message_text(
-        "🛒 *Select a category:*", parse_mode="Markdown",
+        "🛒 <b>Select a category:</b>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
+
 
 async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -152,10 +168,10 @@ async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     p = r.data[0]
     text = (
-        f"*{p['name']}*\n\n"
+        f"<b>{html.escape(p['name'])}</b>\n\n"
         f"💰 Price: {p['price']} {CURRENCY}\n"
         f"📦 Stock: {p['stock']}\n"
-        f"📝 {p.get('description') or '—'}"
+        f"📝 {html.escape(p.get('description') or '—')}"
     )
     kb = []
     if p["stock"] > 0:
@@ -163,7 +179,8 @@ async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         kb.append([InlineKeyboardButton("❌ Out of Stock", callback_data="noop")])
     kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"cat:{p['category']}")])
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 
 async def buy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -177,22 +194,24 @@ async def buy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("purchase failed")
         msg = str(e).lower()
         if "insufficient_balance" in msg:
-            await q.edit_message_text("❌ *Insufficient balance.* Add balance first.", parse_mode="Markdown")
+            await q.edit_message_text("❌ <b>Insufficient balance.</b> Add balance first.", parse_mode="HTML")
         elif "out_of_stock" in msg:
-            await q.edit_message_text("❌ *Out of stock.* Try another.", parse_mode="Markdown")
+            await q.edit_message_text("❌ <b>Out of stock.</b> Try another.", parse_mode="HTML")
         else:
             await q.edit_message_text("❌ Purchase failed. Try again later.")
         return
     await q.edit_message_text(
-        f"✅ *Purchase successful!*\n\n"
-        f"🎁 Your product:\n`{result['content']}`\n\n"
-        f"💳 New balance: *{result['new_balance']} {CURRENCY}*\n"
+        f"✅ <b>Purchase successful!</b>\n\n"
+        f"🎁 Your product:\n<code>{html.escape(str(result['content']))}</code>\n\n"
+        f"💳 New balance: <b>{result['new_balance']} {CURRENCY}</b>\n"
         f"🧾 Order: #{result['order_id']}",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
+
 
 async def noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Not available")
+
 
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -249,6 +268,7 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["state"] = "topup_amount"
     info = html.escape(PAYMENT_INFO)
@@ -259,6 +279,7 @@ async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
+
 async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         amt = float(update.message.text.strip())
@@ -268,8 +289,39 @@ async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.user_data["topup_amount"] = amt
     ctx.user_data["state"] = "topup_txn"
-    await update.message.reply_text("Now send *Transaction ID (TrxID)*:", parse_mode="Markdown")
+    await update.message.reply_text(
+        "Now send <b>Transaction ID (TrxID)</b>:",
+        parse_mode="HTML",
+    )
 
+
+async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txn = update.message.text.strip()
+    amt = ctx.user_data.pop("topup_amount", None)
+    ctx.user_data.pop("state", None)
+    uid = update.effective_user.id
+
+    if not amt:
+        await update.message.reply_text(
+            "Something went wrong. Try again.",
+            reply_markup=main_menu(is_admin(uid)),
+        )
+        return
+
+    await sb(supabase.table("topup_requests").insert({
+        "user_id": uid, "amount": amt, "txn_id": txn, "status": "pending",
+    }))
+
+    await update.message.reply_text(
+        f"✅ <b>Topup request submitted!</b>\n\n"
+        f"Amount: {amt} {CURRENCY}\n"
+        f"TrxID: <code>{html.escape(txn)}</code>\n\n"
+        f"Admin will verify and credit shortly.",
+        parse_mode="HTML",
+        reply_markup=main_menu(is_admin(uid)),
+    )
+
+    for aid in ADMIN_IDS:
         try:
             await ctx.bot.send_message(
                 aid,
@@ -283,29 +335,6 @@ async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    r = await sb(
-        supabase.table("transactions").select("*")
-        .eq("user_id", uid).order("created_at", desc=True).limit(20)
-    )
-    txs = r.data or []
-    if not txs:
-        await update.message.reply_text("📜 No transactions yet.")
-        return
-    lines = ["📜 *Transaction History*\n"]
-    for t in txs:
-        sign = "+" if t["amount"] >= 0 else ""
-        emoji = {"topup": "💰", "purchase": "🛒", "refund": "↩️", "admin_adjust": "⚙️"}.get(t["type"], "•")
-        dt = (t.get("created_at") or "")[:16].replace("T", " ")
-        lines.append(f"{emoji} `{sign}{t['amount']}` {CURRENCY} • {t['type']}\n   _{dt}_ • Bal: {t['balance_after']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def show_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🆘 *Support*\n\nContact: {SUPPORT_CONTACT}\nWe usually reply within a few hours.",
-        parse_mode="Markdown",
-    )
 
 # ---------------- admin ----------------
 async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -317,23 +346,34 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💳 Pending Topups", callback_data="adm:topups")],
         [InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
     ]
-    await update.message.reply_text("⚙️ *Admin Panel*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(
+        "⚙️ <b>Admin Panel</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
 
 async def adm_addprod_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data["state"] = "adm_prod_name"
-    await q.edit_message_text("Send product *name*:", parse_mode="Markdown")
+    await q.edit_message_text("Send product <b>name</b>:", parse_mode="HTML")
+
 
 async def adm_addprod_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["p_name"] = update.message.text.strip()
     ctx.user_data["state"] = "adm_prod_cat"
-    await update.message.reply_text("Send *category* (e.g., vpn, proxy, mail):", parse_mode="Markdown")
+    await update.message.reply_text(
+        "Send <b>category</b> (e.g., vpn, proxy, mail):",
+        parse_mode="HTML",
+    )
+
 
 async def adm_addprod_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["p_cat"] = update.message.text.strip().lower()
     ctx.user_data["state"] = "adm_prod_price"
-    await update.message.reply_text("Send *price* (number):", parse_mode="Markdown")
+    await update.message.reply_text("Send <b>price</b> (number):", parse_mode="HTML")
+
 
 async def adm_addprod_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -343,7 +383,8 @@ async def adm_addprod_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.user_data["p_price"] = price
     ctx.user_data["state"] = "adm_prod_desc"
-    await update.message.reply_text("Send *description* (or /skip):", parse_mode="Markdown")
+    await update.message.reply_text("Send <b>description</b> (or /skip):", parse_mode="HTML")
+
 
 async def adm_addprod_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc = "" if update.message.text.startswith("/skip") else update.message.text.strip()
@@ -356,9 +397,12 @@ async def adm_addprod_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("state", None)
     await sb(supabase.table("products").insert(data))
     await update.message.reply_text(
-        f"✅ Product added: *{data['name']}*\nUse 📦 Add Stock to add deliverable items.",
-        parse_mode="Markdown", reply_markup=main_menu(True),
+        f"✅ Product added: <b>{html.escape(data['name'])}</b>\n"
+        f"Use 📦 Add Stock to add deliverable items.",
+        parse_mode="HTML",
+        reply_markup=main_menu(True),
     )
+
 
 async def adm_addstock_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -371,6 +415,7 @@ async def adm_addstock_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(f"{p['name']} (stock: {p['stock']})", callback_data=f"stk:{p['id']}")] for p in products]
     await q.edit_message_text("Select product to add stock:", reply_markup=InlineKeyboardMarkup(kb))
 
+
 async def adm_addstock_prod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -378,9 +423,10 @@ async def adm_addstock_prod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["stock_pid"] = pid
     ctx.user_data["state"] = "adm_stock_items"
     await q.edit_message_text(
-        "Send stock items, *one per line*.\nEach line = one deliverable item.",
-        parse_mode="Markdown",
+        "Send stock items, <b>one per line</b>.\nEach line = one deliverable item.",
+        parse_mode="HTML",
     )
+
 
 async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pid = ctx.user_data.pop("stock_pid", None)
@@ -397,9 +443,11 @@ async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_stock = r.count or 0
     await sb(supabase.table("products").update({"stock": new_stock}).eq("id", pid))
     await update.message.reply_text(
-        f"✅ Added *{len(lines)}* items. New stock: *{new_stock}*",
-        parse_mode="Markdown", reply_markup=main_menu(True),
+        f"✅ Added <b>{len(lines)}</b> items. New stock: <b>{new_stock}</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu(True),
     )
+
 
 async def adm_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -419,11 +467,15 @@ async def adm_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]])
         await ctx.bot.send_message(
             q.from_user.id,
-            f"*Topup #{req['id']}*\nUser: `{req['user_id']}`\n"
-            f"Amount: {req['amount']} {CURRENCY}\nTrxID: `{req['txn_id']}`\n"
-            f"Date: {(req.get('created_at') or '')[:16].replace('T',' ')}",
-            parse_mode="Markdown", reply_markup=kb,
+            f"<b>Topup #{req['id']}</b>\n"
+            f"User: <code>{req['user_id']}</code>\n"
+            f"Amount: {req['amount']} {CURRENCY}\n"
+            f"TrxID: <code>{html.escape(str(req['txn_id']))}</code>\n"
+            f"Date: {(req.get('created_at') or '')[:16].replace('T', ' ')}",
+            parse_mode="HTML",
+            reply_markup=kb,
         )
+
 
 async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -436,19 +488,23 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await sb(supabase.rpc("approve_topup", {"p_topup_id": tid}))
         except Exception as e:
-            await q.edit_message_text(f"Error: {e}")
+            await q.edit_message_text(f"Error: {html.escape(str(e))}")
             return
         await q.edit_message_text("✅ Approved.")
         r = await sb(supabase.table("topup_requests").select("user_id,amount").eq("id", tid).limit(1))
         if r.data:
             u = r.data[0]
             try:
-                await ctx.bot.send_message(u["user_id"], f"✅ Topup of {u['amount']} {CURRENCY} approved!")
+                await ctx.bot.send_message(
+                    u["user_id"],
+                    f"✅ Topup of {u['amount']} {CURRENCY} approved!",
+                )
             except Exception:
                 pass
     else:
         await sb(supabase.table("topup_requests").update({"status": "rejected"}).eq("id", tid))
         await q.edit_message_text("❌ Rejected.")
+
 
 async def adm_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -460,13 +516,14 @@ async def adm_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     o = await sb(supabase.table("orders").select("id", count="exact"))
     tp = await sb(supabase.table("topup_requests").select("id", count="exact").eq("status", "pending"))
     await q.edit_message_text(
-        f"📊 *Stats*\n\n"
+        f"📊 <b>Stats</b>\n\n"
         f"👥 Users: {u.count or 0}\n"
         f"📦 Products: {p.count or 0}\n"
         f"🛒 Orders: {o.count or 0}\n"
         f"⏳ Pending Topups: {tp.count or 0}",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
+
 
 # ---------------- router ----------------
 async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -509,9 +566,11 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu(is_admin(update.effective_user.id)),
     )
 
+
 # ---------------- healthcheck ----------------
 async def health(request):
     return web.Response(text="OK")
+
 
 async def start_health():
     app = web.Application()
@@ -522,6 +581,7 @@ async def start_health():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(f"✅ Healthcheck listening on :{PORT}")
+
 
 # ---------------- main ----------------
 async def main():
@@ -556,6 +616,7 @@ async def main():
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+
 
 if __name__ == "__main__":
     try:
