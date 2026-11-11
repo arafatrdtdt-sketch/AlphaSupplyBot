@@ -44,6 +44,19 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 
+def btn(text, callback_data=None, url=None, style=None):
+    """Build a dict-format button (supports Telegram button colors).
+    style: 'success' = green, 'primary' = blue, 'danger' = red"""
+    b = {"text": str(text)}
+    if callback_data:
+        b["callback_data"] = callback_data
+    if url:
+        b["url"] = url
+    if style:
+        b["style"] = style
+    return b
+
+
 async def get_user(uid):
     r = await sb(supabase.table("users").select("*").eq("id", uid).limit(1))
     return r.data[0] if r.data else None
@@ -77,13 +90,20 @@ MENU_BUTTONS = {MENU_BUY, MENU_PROFILE, MENU_BALANCE, MENU_HISTORY, MENU_SUPPORT
 
 
 def main_menu(admin: bool = False):
+    """
+    Layout (2↔3 swapped, colored):
+      Row 1: 🛒 Buy Items (green)   | 💰 Add Balance (green)
+      Row 2: 👤 Profile (blue)     | 📜 History (blue)
+      Row 3: 🆘 Support (red)
+      Row 4: ⚙️ Admin Panel (red)  — admin only
+    """
     kb = [
-        [KeyboardButton(MENU_BUY), KeyboardButton(MENU_PROFILE)],
-        [KeyboardButton(MENU_BALANCE), KeyboardButton(MENU_HISTORY)],
-        [KeyboardButton(MENU_SUPPORT)],
+        [{"text": MENU_BUY, "style": "success"}, {"text": MENU_BALANCE, "style": "success"}],
+        [{"text": MENU_PROFILE, "style": "primary"}, {"text": MENU_HISTORY, "style": "primary"}],
+        [{"text": MENU_SUPPORT, "style": "danger"}],
     ]
     if admin:
-        kb.append([KeyboardButton(MENU_ADMIN)])
+        kb.append([{"text": MENU_ADMIN, "style": "danger"}])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -113,7 +133,7 @@ async def show_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not cats:
         await update.message.reply_text("❌ No products available right now.")
         return
-    kb = [[InlineKeyboardButton(f"📦 {c.title()}", callback_data=f"cat:{c}")] for c in cats]
+    kb = [[btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary")] for c in cats]
     await update.message.reply_text(
         "🛒 <b>Select a category:</b>",
         parse_mode="HTML",
@@ -132,12 +152,14 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     kb = []
     for p in products:
-        emoji = "🟢" if p["stock"] > 0 else "🔴"
-        kb.append([InlineKeyboardButton(
+        in_stock = p["stock"] > 0
+        emoji = "🟢" if in_stock else "🔴"
+        kb.append([btn(
             f"{emoji} {p['name']} — {p['price']} {CURRENCY}",
             callback_data=f"prod:{p['id']}",
+            style="success" if in_stock else "danger",
         )])
-    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_cats")])
+    kb.append([btn("⬅️ Back", callback_data="back_cats", style="danger")])
     await q.edit_message_text(
         f"📦 <b>{html.escape(cat.title())}</b>",
         parse_mode="HTML",
@@ -150,7 +172,7 @@ async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     r = await sb(supabase.table("products").select("category").eq("is_active", True))
     cats = sorted({row["category"] for row in (r.data or [])})
-    kb = [[InlineKeyboardButton(f"📦 {c.title()}", callback_data=f"cat:{c}")] for c in cats]
+    kb = [[btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary")] for c in cats]
     await q.edit_message_text(
         "🛒 <b>Select a category:</b>",
         parse_mode="HTML",
@@ -175,10 +197,10 @@ async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     kb = []
     if p["stock"] > 0:
-        kb.append([InlineKeyboardButton("✅ Buy Now", callback_data=f"buy:{pid}")])
+        kb.append([btn("✅ Buy Now", callback_data=f"buy:{pid}", style="success")])
     else:
-        kb.append([InlineKeyboardButton("❌ Out of Stock", callback_data="noop")])
-    kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"cat:{p['category']}")])
+        kb.append([btn("❌ Out of Stock", callback_data="noop", style="danger")])
+    kb.append([btn("⬅️ Back", callback_data=f"cat:{p['category']}", style="danger")])
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -341,10 +363,10 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     kb = [
-        [InlineKeyboardButton("➕ Add Product", callback_data="adm:addprod")],
-        [InlineKeyboardButton("📦 Add Stock", callback_data="adm:addstock")],
-        [InlineKeyboardButton("💳 Pending Topups", callback_data="adm:topups")],
-        [InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
+        [btn("➕ Add Product", callback_data="adm:addprod", style="success")],
+        [btn("📦 Add Stock", callback_data="adm:addstock", style="primary")],
+        [btn("💳 Pending Topups", callback_data="adm:topups", style="primary")],
+        [btn("📊 Stats", callback_data="adm:stats", style="primary")],
     ]
     await update.message.reply_text(
         "⚙️ <b>Admin Panel</b>",
@@ -412,7 +434,7 @@ async def adm_addstock_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not products:
         await q.edit_message_text("No products yet. Add a product first.")
         return
-    kb = [[InlineKeyboardButton(f"{p['name']} (stock: {p['stock']})", callback_data=f"stk:{p['id']}")] for p in products]
+    kb = [[btn(f"{p['name']} (stock: {p['stock']})", callback_data=f"stk:{p['id']}", style="primary")] for p in products]
     await q.edit_message_text("Select product to add stock:", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -462,8 +484,8 @@ async def adm_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"⏳ {len(reqs)} pending topup(s). Sending below...")
     for req in reqs:
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"tup:ok:{req['id']}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"tup:no:{req['id']}"),
+            btn("✅ Approve", callback_data=f"tup:ok:{req['id']}", style="success"),
+            btn("❌ Reject", callback_data=f"tup:no:{req['id']}", style="danger"),
         ]])
         await ctx.bot.send_message(
             q.from_user.id,
@@ -611,7 +633,7 @@ async def main():
     await app.start()
     await app.updater.start_polling()
     try:
-        await asyncio.Event().wait()   # run forever
+        await asyncio.Event().wait()
     finally:
         await app.updater.stop()
         await app.stop()
