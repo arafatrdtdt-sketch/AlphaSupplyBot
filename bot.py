@@ -631,7 +631,7 @@ async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for m in methods:
         kb.append([btn(
-            f"🏦 {m['name']} • min {fmt_price(m['min_amount'])} {CURRENCY}",
+            f"{m['name']}",
             callback_data=f"tp:pick:{m['id']}",
             style="primary",
         )])
