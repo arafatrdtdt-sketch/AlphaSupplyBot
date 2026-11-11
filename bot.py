@@ -96,7 +96,6 @@ def parse_proxy_item(content: str):
 
 
 def format_item_block(idx: int, content: str, total: int = 1) -> str:
-    """Format one deliverable. When total==1, no index number shown."""
     parsed = parse_proxy_item(content)
     proxy_label = "🏷 Proxy Details" if total == 1 else f"🏷 Proxy {idx} Details"
     item_label = "🎁 Item" if total == 1 else f"🎁 Item {idx}"
@@ -111,10 +110,7 @@ def format_item_block(idx: int, content: str, total: int = 1) -> str:
             f"⛔️One-line :\n"
             f"<code>{html.escape(content)}</code>"
         )
-    return (
-        f"{item_label}\n\n"
-        f"<code>{html.escape(content)}</code>"
-    )
+    return f"{item_label}\n\n<code>{html.escape(content)}</code>"
 
 
 async def get_user(uid):
@@ -138,6 +134,21 @@ async def ensure_user(tg_user):
         "is_admin": is_admin(tg_user.id),
     }))
     return r.data[0]
+
+
+async def get_usernames_batch(uids):
+    if not uids:
+        return {}
+    try:
+        r = await sb(supabase.table("users").select("id,username,first_name").in_("id", list(uids)))
+        data = r.data or []
+        return {
+            int(u["id"]): (u.get("username") or u.get("first_name") or f"User {u['id']}")
+            for u in data
+        }
+    except Exception as e:
+        log.warning(f"get_usernames_batch error: {e}")
+        return {}
 
 
 # -------- Menu labels --------
@@ -227,7 +238,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for p in products:
         in_stock = p["stock"] > 0
-        emoji = "" if in_stock else ""
+        emoji = "🟢" if in_stock else "🔴"
         kb.append([btn(
             f"{emoji} {p['name']} — {p['price']} {CURRENCY}",
             callback_data=f"prod:{p['id']}",
@@ -235,7 +246,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )])
     kb.append([btn("⬅️ Back", callback_data="back_cats", style="danger")])
     await q.edit_message_text(
-        f"📦 Please choose a <b>{html.escape(cat.title())}</b> from this list",
+        f"📦 Please choose a <b>{html.escape(cat.title())}</b> to buy",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -321,7 +332,6 @@ async def qty_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = parts[1]
     pid = int(parts[2])
 
-    # Middle info button — just dismiss, no re-render needed
     if action == "info":
         await q.answer()
         return
@@ -434,7 +444,6 @@ async def send_purchase_result(q, ctx, product, items, qty, total_cost, new_bala
         except Exception:
             pass
 
-    # Chunked delivery
     try:
         await q.edit_message_text(header, parse_mode="HTML")
     except Exception:
@@ -639,7 +648,7 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — product management
+# ADMIN — PRODUCT MANAGEMENT
 # ============================================================
 async def build_products_view():
     r = await sb(supabase.table("products").select("*").order("id"))
@@ -717,6 +726,262 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
 
 
 # ============================================================
+# ADMIN — PENDING TOPUPS (paginated list + detail + reject flow)
+# ============================================================
+TOPUPS_PER_PAGE = 10
+
+
+async def build_topups_list_view(page: int = 1):
+    r = await sb(supabase.table("topup_requests").select("*").eq("status", "pending").order("id"))
+    reqs = r.data or []
+
+    if not reqs:
+        kb = [[btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")]]
+        return (
+            "💳 <b>Pending Topups</b>\n\n✅ No pending topups right now.",
+            InlineKeyboardMarkup(kb),
+        )
+
+    total = len(reqs)
+    total_pages = max(1, (total + TOPUPS_PER_PAGE - 1) // TOPUPS_PER_PAGE)
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * TOPUPS_PER_PAGE
+    page_reqs = reqs[start:start + TOPUPS_PER_PAGE]
+
+    uids = list({int(t["user_id"]) for t in page_reqs})
+    uname_map = await get_usernames_batch(uids)
+
+    kb = []
+    for t in page_reqs:
+        uname = uname_map.get(int(t["user_id"])) or f"User {t['user_id']}"
+        uname = uname.lstrip("@")
+        if len(uname) > 16:
+            uname = uname[:14] + "…"
+        amount_str = fmt_price(t["amount"])
+        kb.append([btn(
+            f"👤 @{uname} • {amount_str} {CURRENCY}",
+            callback_data=f"tup:view:{t['id']}",
+            style="primary",
+        )])
+
+    nav = []
+    if page > 1:
+        nav.append(btn("⬅️ Prev", callback_data=f"tup:page:{page-1}", style="primary"))
+    if total_pages > 1:
+        nav.append(btn(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+    if page < total_pages:
+        nav.append(btn("Next ➡️", callback_data=f"tup:page:{page+1}", style="primary"))
+    if nav:
+        kb.append(nav)
+
+    kb.append([btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")])
+
+    text = (
+        f"💳 <b>Pending Topups</b>\n\n"
+        f"📊 Total: <b>{total}</b>  •  Page {page}/{total_pages}\n\n"
+        f"Click a topup to open:"
+    )
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def build_topup_detail_view(tid: int, page_hint: int = 1):
+    r = await sb(supabase.table("topup_requests").select("*").eq("id", tid).limit(1))
+    if not r.data:
+        return "Topup not found.", InlineKeyboardMarkup([[btn("⬅️ Back", callback_data=f"tup:page:{page_hint}", style="primary")]])
+
+    t = r.data[0]
+    status = (t.get("status") or "").lower()
+
+    if status != "pending":
+        uname_map = await get_usernames_batch([int(t["user_id"])])
+        uname = (uname_map.get(int(t["user_id"])) or f"User {t['user_id']}").lstrip("@")
+        reason = t.get("reject_reason") or ""
+        text = (
+            f"💳 <b>Topup #{t['id']}</b>\n\n"
+            f"👤 User: @{html.escape(uname)}\n"
+            f"💰 Amount: {fmt_price(t['amount'])} {CURRENCY}\n"
+            f"📌 Status: <b>{status.upper()}</b>\n"
+        )
+        if reason:
+            text += f"📝 Reason: <i>{html.escape(reason)}</i>\n"
+        kb = [[btn("⬅️ Back to List", callback_data=f"tup:page:{page_hint}", style="primary")]]
+        return text, InlineKeyboardMarkup(kb)
+
+    uname_map = await get_usernames_batch([int(t["user_id"])])
+    uname = (uname_map.get(int(t["user_id"])) or f"User {t['user_id']}").lstrip("@")
+
+    text = (
+        f"💳 <b>Topup #{t['id']}</b>\n\n"
+        f"👤 User: <a href=\"tg://user?id={t['user_id']}\">@{html.escape(uname)}</a>\n"
+        f"🆔 ID: <code>{t['user_id']}</code>\n"
+        f"💰 Amount: <b>{fmt_price(t['amount'])} {CURRENCY}</b>\n"
+        f"📝 TrxID: <code>{html.escape(str(t.get('txn_id') or '—'))}</code>\n"
+        f"📅 Date: {(t.get('created_at') or '')[:16].replace('T', ' ')}\n\n"
+        f"Choose an action:"
+    )
+    kb = [
+        [
+            btn("✅ Approve", callback_data=f"tup:ok:{tid}", style="success"),
+            btn("❌ Reject", callback_data=f"tup:rejstart:{tid}", style="danger"),
+        ],
+        [btn("⬅️ Back to List", callback_data=f"tup:page:{page_hint}", style="primary")],
+    ]
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def _do_reject_topup(ctx, tid: int, reason: str):
+    reason = (reason or "No reason provided").strip()
+    try:
+        await sb(supabase.table("topup_requests").update({
+            "status": "rejected", "reject_reason": reason,
+        }).eq("id", tid))
+    except Exception:
+        try:
+            await sb(supabase.table("topup_requests").update({
+                "status": "rejected",
+            }).eq("id", tid))
+        except Exception as e:
+            log.error(f"reject topup error: {e}")
+            return False
+
+    r = await sb(supabase.table("topup_requests").select("user_id,amount").eq("id", tid).limit(1))
+    if r.data:
+        u = r.data[0]
+        try:
+            await ctx.bot.send_message(
+                u["user_id"],
+                f"❌ <b>Topup Rejected</b>\n\n"
+                f"Amount: {fmt_price(u['amount'])} {CURRENCY}\n"
+                f"Reason: <i>{html.escape(reason)}</i>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    return True
+
+
+async def adm_btn_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    text, kbd = await build_topups_list_view(1)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kbd)
+
+
+async def adm_topup_reject_reason_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tid = ctx.user_data.pop("reject_topup_id", None)
+    ctx.user_data.pop("state", None)
+    if not tid:
+        await update.message.reply_text("Session expired. Try again.")
+        return
+    reason = update.message.text.strip() or "No reason provided"
+    await _do_reject_topup(ctx, int(tid), reason)
+    text, kbd = await build_topups_list_view(1)
+    await update.message.reply_text(
+        f"❌ Topup #{tid} rejected.\n\n{text}",
+        parse_mode="HTML", reply_markup=kbd,
+    )
+
+
+async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    data = q.data
+
+    # Cancel reject flow
+    if data == "tup:rejcancel":
+        tid = ctx.user_data.pop("reject_topup_id", None)
+        ctx.user_data.pop("state", None)
+        if tid:
+            text, kb = await build_topup_detail_view(int(tid))
+        else:
+            text, kb = await build_topups_list_view(1)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+    action = parts[1]
+
+    if action == "page":
+        page = int(parts[2])
+        text, kb = await build_topups_list_view(page)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif action == "view":
+        tid = int(parts[2])
+        text, kb = await build_topup_detail_view(tid)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif action == "ok":
+        tid = int(parts[2])
+        try:
+            await sb(supabase.rpc("approve_topup", {"p_topup_id": tid}))
+        except Exception as e:
+            await q.answer(f"Error: {str(e)[:100]}", show_alert=True)
+            return
+        r = await sb(supabase.table("topup_requests").select("user_id,amount").eq("id", tid).limit(1))
+        if r.data:
+            u = r.data[0]
+            try:
+                await ctx.bot.send_message(
+                    u["user_id"],
+                    f"✅ Topup of {fmt_price(u['amount'])} {CURRENCY} approved!",
+                )
+            except Exception:
+                pass
+        await q.answer("✅ Approved!", show_alert=False)
+        text, kb = await build_topups_list_view(1)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif action == "rejstart":
+        tid = int(parts[2])
+        ctx.user_data["reject_topup_id"] = tid
+        ctx.user_data["state"] = "adm_topup_reject"
+        kb = [
+            [btn("⏭️ Skip (Reject Without Reason)", callback_data=f"tup:rejskip:{tid}", style="danger")],
+            [btn("❌ Cancel", callback_data="tup:rejcancel", style="primary")],
+        ]
+        try:
+            await q.edit_message_text(
+                f"❌ <b>Reject Topup #{tid}</b>\n\n"
+                f"Send the rejection reason as a text message.\n\n"
+                f"Or tap <b>Skip</b> to reject without a reason.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+        except Exception:
+            pass
+
+    elif action == "rejskip":
+        tid = int(parts[2])
+        ctx.user_data.pop("reject_topup_id", None)
+        ctx.user_data.pop("state", None)
+        await _do_reject_topup(ctx, tid, "No reason provided")
+        await q.answer("❌ Rejected.", show_alert=False)
+        text, kb = await build_topups_list_view(1)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+
+# ============================================================
 # ADMIN — text-menu entry points
 # ============================================================
 async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -743,31 +1008,6 @@ async def adm_btn_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=admin_menu(),
     )
-
-
-async def adm_btn_topups(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    r = await sb(supabase.table("topup_requests").select("*").eq("status", "pending").order("id"))
-    reqs = r.data or []
-    if not reqs:
-        await update.message.reply_text("No pending topups.", reply_markup=admin_menu())
-        return
-    await update.message.reply_text(f"⏳ {len(reqs)} pending topup(s):", reply_markup=admin_menu())
-    for req in reqs:
-        kb = InlineKeyboardMarkup([[
-            btn("✅ Approve", callback_data=f"tup:ok:{req['id']}", style="success"),
-            btn("❌ Reject", callback_data=f"tup:no:{req['id']}", style="danger"),
-        ]])
-        await update.message.reply_text(
-            f"<b>Topup #{req['id']}</b>\n"
-            f"User: <code>{req['user_id']}</code>\n"
-            f"Amount: {req['amount']} {CURRENCY}\n"
-            f"TrxID: <code>{html.escape(str(req['txn_id']))}</code>\n"
-            f"Date: {(req.get('created_at') or '')[:16].replace('T', ' ')}",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
 
 
 async def adm_btn_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -842,10 +1082,7 @@ async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pid = ctx.user_data.pop("stock_pid", None)
     ctx.user_data.pop("state", None)
     if not pid:
-        await update.message.reply_text(
-            "Session lost. Try again.",
-            reply_markup=admin_menu(),
-        )
+        await update.message.reply_text("Session lost. Try again.", reply_markup=admin_menu())
         return
     lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
     if not lines:
@@ -944,7 +1181,7 @@ async def adm_broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — inline callbacks
+# ADMIN — inline callbacks (adm:*)
 # ============================================================
 async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1079,38 +1316,6 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — topup actions
-# ============================================================
-async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    parts = q.data.split(":")
-    action, tid = parts[1], int(parts[2])
-    if action == "ok":
-        try:
-            await sb(supabase.rpc("approve_topup", {"p_topup_id": tid}))
-        except Exception as e:
-            await q.edit_message_text(f"Error: {html.escape(str(e))}")
-            return
-        await q.edit_message_text("✅ Approved.")
-        r = await sb(supabase.table("topup_requests").select("user_id,amount").eq("id", tid).limit(1))
-        if r.data:
-            u = r.data[0]
-            try:
-                await ctx.bot.send_message(
-                    u["user_id"],
-                    f"✅ Topup of {u['amount']} {CURRENCY} approved!",
-                )
-            except Exception:
-                pass
-    else:
-        await sb(supabase.table("topup_requests").update({"status": "rejected"}).eq("id", tid))
-        await q.edit_message_text("❌ Rejected.")
-
-
-# ============================================================
 # ROUTER
 # ============================================================
 async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1174,6 +1379,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await adm_edit_price_handler(update, ctx)
     if state == "adm_broadcast":
         return await adm_broadcast_handler(update, ctx)
+    if state == "adm_topup_reject":
+        return await adm_topup_reject_reason_handler(update, ctx)
 
     kb = admin_menu() if (user_is_admin and ctx.user_data.get("in_admin")) else main_menu(user_is_admin)
     await update.message.reply_text("Unknown option. Use the menu.", reply_markup=kb)
