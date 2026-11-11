@@ -56,14 +56,63 @@ def btn(text, callback_data=None, url=None, style=None):
     return b
 
 
+def fmt_price(val):
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        return "0.00"
+    return f"{val:.2f}"
+
+
 def extract_support_username() -> str:
-    """Turn SUPPORT_CONTACT into a bare username (strip @, t.me/, https://t.me/, etc)."""
     raw = (SUPPORT_CONTACT or "").strip()
     for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
             break
     return raw.lstrip("@").strip()
+
+
+def parse_proxy_item(content: str):
+    """Parse 'server:port:username:password' → tuple, else None."""
+    content = (content or "").strip()
+    if not content:
+        return None
+    parts = content.split(":")
+    if len(parts) < 4:
+        return None
+    try:
+        port_num = int(parts[1])
+    except (ValueError, TypeError):
+        return None
+    if port_num < 1 or port_num > 65535:
+        return None
+    server = parts[0].strip()
+    port = parts[1].strip()
+    password = parts[-1].strip()
+    username = ":".join(parts[2:-1]).strip()
+    if not server or not username or not password:
+        return None
+    return server, port, username, password
+
+
+def format_item_block(idx: int, content: str) -> str:
+    parsed = parse_proxy_item(content)
+    if parsed:
+        server, port, username, password = parsed
+        return (
+            f"🏷Proxy {idx} Details\n\n"
+            f"Server : <code>{html.escape(server)}</code>\n\n"
+            f"Port : <code>{html.escape(port)}</code>\n\n"
+            f"Username : <code>{html.escape(username)}</code>\n\n"
+            f"Password : <code>{html.escape(password)}</code>\n\n"
+            f"⛔️One-line :\n"
+            f"<code>{html.escape(content)}</code>"
+        )
+    return (
+        f"🎁Item {idx}\n\n"
+        f"<code>{html.escape(content)}</code>"
+    )
 
 
 async def get_user(uid):
@@ -127,7 +176,9 @@ def admin_menu():
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
-# ---------------- user handlers ----------------
+# ============================================================
+# USER HANDLERS
+# ============================================================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update.effective_user)
     ctx.user_data["in_admin"] = False
@@ -202,7 +253,56 @@ async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============================================================
+# QUANTITY SELECTOR VIEW
+# ============================================================
+def build_quantity_view(product, qty):
+    max_q = max(1, int(product["stock"]))
+    if product["stock"] <= 0:
+        qty = 1
+    else:
+        qty = max(1, min(qty, max_q))
+    total = float(product["price"]) * qty
+
+    text = (
+        f"🛒 <b>{html.escape(product['name'])}</b>\n\n"
+        f"💰 Price: {fmt_price(product['price'])} {CURRENCY}\n"
+        f"📦 Stock: {product['stock']}\n"
+        f"📝 {html.escape(product.get('description') or '—')}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔢 Quantity: <b>{qty}</b>\n"
+        f"💵 Total: <b>{fmt_price(total)} {CURRENCY}</b>\n"
+        f"━━━━━━━━━━━━━━━"
+    )
+
+    if product["stock"] <= 0:
+        kb = [
+            [btn("❌ Out of Stock", callback_data="noop", style="danger")],
+            [btn("⬅️ Back", callback_data=f"cat:{product['category']}", style="danger")],
+        ]
+    else:
+        kb = [
+            [
+                btn("➖", callback_data=f"qty:dec:{product['id']}:{qty}", style="danger"),
+                btn("➕", callback_data=f"qty:inc:{product['id']}:{qty}", style="success"),
+            ],
+            [btn("✏️ Enter Quantity Manually", callback_data=f"qty:manual:{product['id']}", style="primary")],
+            [btn("✅ Confirm & Buy", callback_data=f"qty:buy:{product['id']}:{qty}", style="success")],
+            [btn("⬅️ Back", callback_data=f"cat:{product['category']}", style="danger")],
+        ]
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def render_quantity_view(q, product, qty):
+    text, kb = build_quantity_view(product, qty)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+
 async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User clicks a product → show quantity selector."""
     q = update.callback_query
     await q.answer()
     pid = int(q.data.split(":", 1)[1])
@@ -211,52 +311,198 @@ async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Product not found.")
         return
     p = r.data[0]
-    text = (
-        f"<b>{html.escape(p['name'])}</b>\n\n"
-        f"💰 Price: {p['price']} {CURRENCY}\n"
-        f"📦 Stock: {p['stock']}\n"
-        f"📝 {html.escape(p.get('description') or '—')}"
-    )
-    kb = []
-    if p["stock"] > 0:
-        kb.append([btn("✅ Buy Now", callback_data=f"buy:{pid}", style="success")])
-    else:
-        kb.append([btn("❌ Out of Stock", callback_data="noop", style="danger")])
-    kb.append([btn("⬅️ Back", callback_data=f"cat:{p['category']}", style="danger")])
-    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    await render_quantity_view(q, p, 1)
 
 
-async def buy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def qty_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    pid = int(q.data.split(":", 1)[1])
+    parts = q.data.split(":")
+    action = parts[1]
+    pid = int(parts[2])
+
+    r = await sb(supabase.table("products").select("*").eq("id", pid).limit(1))
+    if not r.data:
+        await q.answer("Product not found.", show_alert=True)
+        return
+    p = r.data[0]
+
+    if action == "inc":
+        qty = int(parts[3]) + 1
+        if qty > p["stock"]:
+            await q.answer(f"Only {p['stock']} in stock!", show_alert=True)
+            return
+        await q.answer()
+        await render_quantity_view(q, p, qty)
+
+    elif action == "dec":
+        qty = max(1, int(parts[3]) - 1)
+        await q.answer()
+        await render_quantity_view(q, p, qty)
+
+    elif action == "manual":
+        await q.answer()
+        ctx.user_data["qty_manual_pid"] = pid
+        ctx.user_data["state"] = "qty_manual"
+        await q.edit_message_text(
+            f"🔢 <b>Enter Quantity</b>\n\n"
+            f"Product: <b>{html.escape(p['name'])}</b>\n"
+            f"Price: {fmt_price(p['price'])} {CURRENCY}\n"
+            f"Available Stock: {p['stock']}\n\n"
+            f"Send a number between <b>1</b> and <b>{p['stock']}</b>:",
+            parse_mode="HTML",
+        )
+
+    elif action == "buy":
+        qty = int(parts[3])
+        await do_purchase(q, ctx, p, qty)
+
+
+async def qty_manual_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pid = ctx.user_data.pop("qty_manual_pid", None)
+    ctx.user_data.pop("state", None)
+    if not pid:
+        await update.message.reply_text("Session expired. Use /start.")
+        return
+    txt = update.message.text.strip()
+    try:
+        qty = int(txt)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid. Send a whole number:")
+        ctx.user_data["qty_manual_pid"] = pid
+        ctx.user_data["state"] = "qty_manual"
+        return
+
+    r = await sb(supabase.table("products").select("*").eq("id", pid).limit(1))
+    if not r.data:
+        await update.message.reply_text("Product not found.")
+        return
+    p = r.data[0]
+
+    if qty < 1:
+        qty = 1
+    if qty > p["stock"]:
+        await update.message.reply_text(
+            f"❌ Only <b>{p['stock']}</b> in stock. Send a number between 1 and {p['stock']}:",
+            parse_mode="HTML",
+        )
+        ctx.user_data["qty_manual_pid"] = pid
+        ctx.user_data["state"] = "qty_manual"
+        return
+
+    text, kb = build_quantity_view(p, qty)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ============================================================
+# PURCHASE EXECUTION
+# ============================================================
+def build_purchase_header(product, qty, total_cost, new_balance):
+    header = (
+        "✅ <b>Purchase Successful</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦Product Name :- 🛍 <b>{html.escape(product['name'])}</b>\n"
+    )
+    if qty > 1:
+        header += f"🔢Quantity :- <b>{qty}</b>\n"
+    header += (
+        f"💵Price :- {fmt_price(total_cost)} {CURRENCY}\n"
+        f"💳Your Balance :- {fmt_price(new_balance)} {CURRENCY}\n"
+    )
+    return header
+
+
+async def send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance):
+    header = build_purchase_header(product, qty, total_cost, new_balance)
+    blocks = [format_item_block(i, c) for i, c in enumerate(items, 1)]
+
+    full_parts = [header]
+    for block in blocks:
+        full_parts.append("━━━━━━━━━━━━━━━━━━━━━━\n" + block)
+    full = "\n\n".join(full_parts)
+
+    if len(full) <= 4000:
+        try:
+            await q.edit_message_text(full, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    # Split into chunks if too long
+    try:
+        await q.edit_message_text(header, parse_mode="HTML")
+    except Exception:
+        try:
+            await ctx.bot.send_message(q.from_user.id, header, parse_mode="HTML")
+        except Exception:
+            pass
+
+    current = ""
+    for block in blocks:
+        seg = "━━━━━━━━━━━━━━━━━━━━━━\n" + block + "\n\n"
+        if len(current) + len(seg) > 3800:
+            if current.strip():
+                try:
+                    await ctx.bot.send_message(q.from_user.id, current.rstrip(), parse_mode="HTML")
+                except Exception:
+                    pass
+            current = seg
+        else:
+            current += seg
+    if current.strip():
+        try:
+            await ctx.bot.send_message(q.from_user.id, current.rstrip(), parse_mode="HTML")
+        except Exception:
+            pass
+
+
+async def do_purchase(q, ctx, product, qty):
     uid = q.from_user.id
     try:
-        r = await sb(supabase.rpc("purchase_product", {"p_user_id": uid, "p_product_id": pid}))
+        r = await sb(supabase.rpc("purchase_product_batch", {
+            "p_user_id": uid,
+            "p_product_id": product["id"],
+            "p_quantity": qty,
+        }))
         result = r.data
     except Exception as e:
         log.exception("purchase failed")
         msg = str(e).lower()
         if "insufficient_balance" in msg:
-            await q.edit_message_text("❌ <b>Insufficient balance.</b> Add balance first.", parse_mode="HTML")
+            need = float(product["price"]) * qty
+            await q.answer(
+                f"❌ Insufficient balance. Need {fmt_price(need)} {CURRENCY}. Reduce quantity or add balance.",
+                show_alert=True,
+            )
+            await render_quantity_view(q, product, qty)
         elif "out_of_stock" in msg:
-            await q.edit_message_text("❌ <b>Out of stock.</b> Try another.", parse_mode="HTML")
+            await q.answer("❌ Not enough stock. Reduce quantity.", show_alert=True)
+            await render_quantity_view(q, product, qty)
         else:
-            await q.edit_message_text("❌ Purchase failed. Try again later.")
+            await q.answer("❌ Purchase failed. Try again.", show_alert=True)
         return
-    await q.edit_message_text(
-        f"✅ <b>Purchase successful!</b>\n\n"
-        f"🎁 Your product:\n<code>{html.escape(str(result['content']))}</code>\n\n"
-        f"💳 New balance: <b>{result['new_balance']} {CURRENCY}</b>\n"
-        f"🧾 Order: #{result['order_id']}",
-        parse_mode="HTML",
-    )
+
+    await q.answer("✅ Purchase successful!")
+
+    items = result.get("items", []) or []
+    if isinstance(items, str):
+        import json as _json
+        try:
+            items = _json.loads(items)
+        except Exception:
+            items = [items]
+    new_balance = result.get("new_balance", 0)
+    total_cost = result.get("total_cost", 0)
+
+    await send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance)
 
 
 async def noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Not available")
 
 
+# ============================================================
+# PROFILE / HISTORY / SUPPORT / TOPUP
+# ============================================================
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = await get_user(uid)
@@ -386,7 +632,7 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — product management helpers
+# ADMIN — product management
 # ============================================================
 async def build_products_view():
     r = await sb(supabase.table("products").select("*").order("id"))
@@ -433,7 +679,7 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
     text = (
         f"📦 <b>{html.escape(p['name'])}</b>\n\n"
         f"🏷️ Category: {html.escape(p['category'])}\n"
-        f"💰 Price: {p['price']} {CURRENCY}\n"
+        f"💰 Price: {fmt_price(p['price'])} {CURRENCY}\n"
         f"📝 {html.escape(p.get('description') or '—')}\n\n"
         f"📊 <b>Stock Info:</b>\n"
         f"🟢 Available: <b>{unsold}</b>\n"
@@ -441,12 +687,21 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
         f"📦 Total: {total}\n"
         f"Status: {'✅ Active' if p.get('is_active') else '❌ Inactive'}"
     )
-    kb = [
-        [btn("➕ Add Stock", callback_data=f"adm:stock:{pid}", style="success"),
-         btn("🗑️ Clear Unsold", callback_data=f"adm:clrstock:{pid}", style="danger")],
-        [btn("🗑️ Delete Product", callback_data=f"adm:delconf:{pid}", style="danger")],
-        [btn("⬅️ Back to Products", callback_data="adm:prods", style="primary")],
-    ]
+
+    if p.get("is_active"):
+        kb = [
+            [btn("➕ Add Stock", callback_data=f"adm:stock:{pid}", style="success"),
+             btn("🗑️ Clear Unsold", callback_data=f"adm:clrstock:{pid}", style="danger")],
+            [btn("✏️ Edit Price", callback_data=f"adm:eprice:{pid}", style="primary"),
+             btn("🗑️ Delete Product", callback_data=f"adm:delconf:{pid}", style="danger")],
+            [btn("⬅️ Back to Products", callback_data="adm:prods", style="primary")],
+        ]
+    else:
+        kb = [
+            [btn("✅ Reactivate Product", callback_data=f"adm:reactivate:{pid}", style="success")],
+            [btn("🗑️ Delete Permanently", callback_data=f"adm:delconf:{pid}", style="danger")],
+            [btn("⬅️ Back to Products", callback_data="adm:prods", style="primary")],
+        ]
     markup = InlineKeyboardMarkup(kb)
     if is_callback:
         await target.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
@@ -527,7 +782,7 @@ async def adm_btn_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — add-product state flow (started via inline adm:newprod)
+# ADMIN — add-product state flow
 # ============================================================
 async def adm_addprod_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["p_name"] = update.message.text.strip()
@@ -574,7 +829,7 @@ async def adm_addprod_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — add-stock state flow (started via inline adm:stock:{id})
+# ADMIN — add-stock state flow
 # ============================================================
 async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pid = ctx.user_data.pop("stock_pid", None)
@@ -596,6 +851,32 @@ async def adm_addstock_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sb(supabase.table("products").update({"stock": new_stock}).eq("id", pid))
     await update.message.reply_text(
         f"✅ Added <b>{len(lines)}</b> items. New stock: <b>{new_stock}</b>",
+        parse_mode="HTML",
+    )
+    await show_admin_product_detail(update.message, pid, is_callback=False)
+
+
+# ============================================================
+# ADMIN — edit-price state flow
+# ============================================================
+async def adm_edit_price_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pid = ctx.user_data.pop("edit_price_pid", None)
+    ctx.user_data.pop("state", None)
+    if not pid:
+        await update.message.reply_text("Session expired. Try again.", reply_markup=admin_menu())
+        return
+    try:
+        new_price = float(update.message.text.strip())
+        if new_price < 0:
+            new_price = 0.0
+    except ValueError:
+        await update.message.reply_text("❌ Invalid price. Send a number:")
+        ctx.user_data["edit_price_pid"] = pid
+        ctx.user_data["state"] = "adm_edit_price"
+        return
+    await sb(supabase.table("products").update({"price": new_price}).eq("id", pid))
+    await update.message.reply_text(
+        f"✅ Price updated to <b>{fmt_price(new_price)} {CURRENCY}</b>",
         parse_mode="HTML",
     )
     await show_admin_product_detail(update.message, pid, is_callback=False)
@@ -717,6 +998,31 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Unsold stock cleared!", show_alert=True)
         await show_admin_product_detail(q, pid, is_callback=True)
 
+    elif data.startswith("adm:eprice:"):
+        await q.answer()
+        pid = int(data.split(":")[2])
+        r = await sb(supabase.table("products").select("name,price").eq("id", pid).limit(1))
+        if not r.data:
+            await q.edit_message_text("Product not found.")
+            return
+        p = r.data[0]
+        ctx.user_data["edit_price_pid"] = pid
+        ctx.user_data["state"] = "adm_edit_price"
+        await q.edit_message_text(
+            f"✏️ <b>Edit Price</b>\n\n"
+            f"Product: <b>{html.escape(p['name'])}</b>\n"
+            f"Current price: {fmt_price(p['price'])} {CURRENCY}\n\n"
+            f"Send the new price (number):",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("adm:reactivate:"):
+        await q.answer()
+        pid = int(data.split(":")[2])
+        await sb(supabase.table("products").update({"is_active": True}).eq("id", pid))
+        await q.answer("Product reactivated!", show_alert=True)
+        await show_admin_product_detail(q, pid, is_callback=True)
+
     elif data.startswith("adm:delconf:"):
         await q.answer()
         pid = int(data.split(":")[2])
@@ -732,22 +1038,34 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             f"⚠️ <b>Delete Product?</b>\n\n"
             f"<b>{html.escape(p['name'])}</b>\n\n"
-            f"All stock items will also be permanently deleted. This cannot be undone.",
+            f"If this product has order history, it will be <b>deactivated</b> instead.\n"
+            f"Otherwise it will be permanently removed.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
     elif data.startswith("adm:delyes:"):
-        await q.answer("Deleting...")
+        await q.answer("Processing...")
         pid = int(data.split(":")[2])
         try:
-            await sb(supabase.table("product_items").delete().eq("product_id", pid))
-            await sb(supabase.table("products").delete().eq("id", pid))
+            order_check = await sb(supabase.table("orders").select("id", count="exact").eq("product_id", pid))
+            has_orders = (order_check.count or 0) > 0
+
+            if has_orders:
+                await sb(supabase.table("products").update({"is_active": False}).eq("id", pid))
+                note = "✅ Product <b>deactivated</b> (has order history)."
+            else:
+                await sb(supabase.table("product_items").delete().eq("product_id", pid))
+                await sb(supabase.table("products").delete().eq("id", pid))
+                note = "✅ Product <b>deleted permanently</b>."
         except Exception as e:
             await q.edit_message_text(f"❌ Error: {html.escape(str(e))}")
             return
         text, kbd = await build_products_view()
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kbd)
+        try:
+            await q.edit_message_text(f"{note}\n\n{text}", parse_mode="HTML", reply_markup=kbd)
+        except Exception:
+            await ctx.bot.send_message(q.from_user.id, text, parse_mode="HTML", reply_markup=kbd)
 
     else:
         await q.answer()
@@ -836,6 +1154,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await topup_amount_handler(update, ctx)
     if state == "topup_txn":
         return await topup_txn_handler(update, ctx)
+    if state == "qty_manual":
+        return await qty_manual_handler(update, ctx)
     if state == "adm_prod_name":
         return await adm_addprod_name(update, ctx)
     if state == "adm_prod_cat":
@@ -846,6 +1166,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await adm_addprod_desc(update, ctx)
     if state == "adm_stock_items":
         return await adm_addstock_items(update, ctx)
+    if state == "adm_edit_price":
+        return await adm_edit_price_handler(update, ctx)
     if state == "adm_broadcast":
         return await adm_broadcast_handler(update, ctx)
 
@@ -884,7 +1206,7 @@ async def main():
     # user
     app.add_handler(CallbackQueryHandler(cat_callback, pattern="^cat:"))
     app.add_handler(CallbackQueryHandler(prod_callback, pattern="^prod:"))
-    app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy:"))
+    app.add_handler(CallbackQueryHandler(qty_callback, pattern="^qty:"))
     app.add_handler(CallbackQueryHandler(back_cats, pattern="^back_cats$"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
 
