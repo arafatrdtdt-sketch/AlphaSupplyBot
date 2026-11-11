@@ -74,7 +74,6 @@ def extract_support_username() -> str:
 
 
 def parse_proxy_item(content: str):
-    """Parse 'server:port:username:password' → tuple, else None."""
     content = (content or "").strip()
     if not content:
         return None
@@ -96,12 +95,15 @@ def parse_proxy_item(content: str):
     return server, port, username, password
 
 
-def format_item_block(idx: int, content: str) -> str:
+def format_item_block(idx: int, content: str, total: int = 1) -> str:
+    """Format one deliverable. When total==1, no index number shown."""
     parsed = parse_proxy_item(content)
+    proxy_label = "🏷 Proxy Details" if total == 1 else f"🏷 Proxy {idx} Details"
+    item_label = "🎁 Item" if total == 1 else f"🎁 Item {idx}"
     if parsed:
         server, port, username, password = parsed
         return (
-            f"🏷Proxy {idx} Details\n\n"
+            f"{proxy_label}\n\n"
             f"Server : <code>{html.escape(server)}</code>\n\n"
             f"Port : <code>{html.escape(port)}</code>\n\n"
             f"Username : <code>{html.escape(username)}</code>\n\n"
@@ -110,7 +112,7 @@ def format_item_block(idx: int, content: str) -> str:
             f"<code>{html.escape(content)}</code>"
         )
     return (
-        f"🎁Item {idx}\n\n"
+        f"{item_label}\n\n"
         f"<code>{html.escape(content)}</code>"
     )
 
@@ -138,7 +140,7 @@ async def ensure_user(tg_user):
     return r.data[0]
 
 
-# -------- Main menu labels --------
+# -------- Menu labels --------
 MENU_BUY = "🛒 Buy Items"
 MENU_BALANCE = "💰 Add Balance"
 MENU_PROFILE = "👤 Profile"
@@ -147,7 +149,6 @@ MENU_SUPPORT = "🆘 Support"
 MENU_ADMIN = "⚙️ Admin Panel"
 MENU_BUTTONS = {MENU_BUY, MENU_BALANCE, MENU_PROFILE, MENU_HISTORY, MENU_SUPPORT, MENU_ADMIN}
 
-# -------- Admin menu labels --------
 ADM_PRODUCTS = "📦 Product"
 ADM_BROADCAST = "📢 Broadcast"
 ADM_TOPUPS = "💳 Pending Topups"
@@ -254,7 +255,7 @@ async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# QUANTITY SELECTOR VIEW
+# QUANTITY SELECTOR
 # ============================================================
 def build_quantity_view(product, qty):
     max_q = max(1, int(product["stock"]))
@@ -284,7 +285,8 @@ def build_quantity_view(product, qty):
         kb = [
             [
                 btn("➖", callback_data=f"qty:dec:{product['id']}:{qty}", style="danger"),
-                btn("➕", callback_data=f"qty:inc:{product['id']}:{qty}", style="success"),
+                btn(f"🔢 {qty}", callback_data=f"qty:info:{product['id']}", style="success"),
+                btn("➕", callback_data=f"qty:inc:{product['id']}:{qty}", style="primary"),
             ],
             [btn("✏️ Enter Quantity Manually", callback_data=f"qty:manual:{product['id']}", style="primary")],
             [btn("✅ Confirm & Buy", callback_data=f"qty:buy:{product['id']}:{qty}", style="success")],
@@ -302,7 +304,6 @@ async def render_quantity_view(q, product, qty):
 
 
 async def prod_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User clicks a product → show quantity selector."""
     q = update.callback_query
     await q.answer()
     pid = int(q.data.split(":", 1)[1])
@@ -319,6 +320,11 @@ async def qty_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     action = parts[1]
     pid = int(parts[2])
+
+    # Middle info button — just dismiss, no re-render needed
+    if action == "info":
+        await q.answer()
+        return
 
     r = await sb(supabase.table("products").select("*").eq("id", pid).limit(1))
     if not r.data:
@@ -413,7 +419,8 @@ def build_purchase_header(product, qty, total_cost, new_balance):
 
 async def send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance):
     header = build_purchase_header(product, qty, total_cost, new_balance)
-    blocks = [format_item_block(i, c) for i, c in enumerate(items, 1)]
+    total_items = len(items)
+    blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(items, 1)]
 
     full_parts = [header]
     for block in blocks:
@@ -427,7 +434,7 @@ async def send_purchase_result(q, ctx, product, items, qty, total_cost, new_bala
         except Exception:
             pass
 
-    # Split into chunks if too long
+    # Chunked delivery
     try:
         await q.edit_message_text(header, parse_mode="HTML")
     except Exception:
@@ -470,7 +477,7 @@ async def do_purchase(q, ctx, product, qty):
         if "insufficient_balance" in msg:
             need = float(product["price"]) * qty
             await q.answer(
-                f"❌ Insufficient balance. Need {fmt_price(need)} {CURRENCY}. Reduce quantity or add balance.",
+                f"❌ Insufficient balance. Need {fmt_price(need)} {CURRENCY}.",
                 show_alert=True,
             )
             await render_quantity_view(q, product, qty)
@@ -883,7 +890,7 @@ async def adm_edit_price_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 # ============================================================
-# ADMIN — broadcast state flow
+# ADMIN — broadcast
 # ============================================================
 async def adm_broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("state", None)
@@ -937,7 +944,7 @@ async def adm_broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — inline callback handler (adm:*)
+# ADMIN — inline callbacks
 # ============================================================
 async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1072,7 +1079,7 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — topup approve/reject
+# ADMIN — topup actions
 # ============================================================
 async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1111,7 +1118,6 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = ctx.user_data.get("state")
     user_is_admin = is_admin(update.effective_user.id)
 
-    # 1) Admin text buttons
     if text in ADMIN_BUTTONS and user_is_admin:
         ctx.user_data.pop("state", None)
         if text == ADM_PRODUCTS:
@@ -1131,7 +1137,6 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         return
 
-    # 2) Main menu buttons
     if text in MENU_BUTTONS:
         ctx.user_data.pop("state", None)
         if text == MENU_ADMIN:
@@ -1149,7 +1154,6 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await show_support(update, ctx)
         return
 
-    # 3) Conversation states
     if state == "topup_amount":
         return await topup_amount_handler(update, ctx)
     if state == "topup_txn":
@@ -1171,13 +1175,12 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state == "adm_broadcast":
         return await adm_broadcast_handler(update, ctx)
 
-    # 4) Fallback
     kb = admin_menu() if (user_is_admin and ctx.user_data.get("in_admin")) else main_menu(user_is_admin)
     await update.message.reply_text("Unknown option. Use the menu.", reply_markup=kb)
 
 
 # ============================================================
-# HEALTHCHECK
+# HEALTHCHECK / MAIN
 # ============================================================
 async def health(request):
     return web.Response(text="OK")
@@ -1194,23 +1197,18 @@ async def start_health():
     log.info(f"✅ Healthcheck listening on :{PORT}")
 
 
-# ============================================================
-# MAIN
-# ============================================================
 async def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # user
     app.add_handler(CallbackQueryHandler(cat_callback, pattern="^cat:"))
     app.add_handler(CallbackQueryHandler(prod_callback, pattern="^prod:"))
     app.add_handler(CallbackQueryHandler(qty_callback, pattern="^qty:"))
     app.add_handler(CallbackQueryHandler(back_cats, pattern="^back_cats$"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
 
-    # admin
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
     app.add_handler(CallbackQueryHandler(adm_callback, pattern="^adm:"))
 
