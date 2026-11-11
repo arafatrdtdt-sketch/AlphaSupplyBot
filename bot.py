@@ -151,6 +151,34 @@ async def get_usernames_batch(uids):
         return {}
 
 
+# -------- Payment Methods helpers --------
+async def get_active_payment_methods():
+    try:
+        r = await sb(supabase.table("payment_methods").select("*").eq("is_active", True).order("id"))
+        return r.data or []
+    except Exception as e:
+        log.error(f"get_active_payment_methods error: {e}")
+        return []
+
+
+async def get_all_payment_methods():
+    try:
+        r = await sb(supabase.table("payment_methods").select("*").order("id"))
+        return r.data or []
+    except Exception as e:
+        log.error(f"get_all_payment_methods error: {e}")
+        return []
+
+
+async def get_payment_method(pmid):
+    try:
+        r = await sb(supabase.table("payment_methods").select("*").eq("id", pmid).limit(1))
+        return r.data[0] if r.data else None
+    except Exception as e:
+        log.error(f"get_payment_method error: {e}")
+        return None
+
+
 # -------- Menu labels --------
 MENU_BUY = "🛒 Buy Items"
 MENU_BALANCE = "💰 Add Balance"
@@ -164,8 +192,9 @@ ADM_PRODUCTS = "📦 Product"
 ADM_BROADCAST = "📢 Broadcast"
 ADM_TOPUPS = "💳 Pending Topups"
 ADM_STATS = "📊 Stats"
+ADM_PAYMENTS = "🏦 Payment Methods"
 ADM_BACK = "⬅️ Back to Main Menu"
-ADMIN_BUTTONS = {ADM_PRODUCTS, ADM_BROADCAST, ADM_TOPUPS, ADM_STATS, ADM_BACK}
+ADMIN_BUTTONS = {ADM_PRODUCTS, ADM_BROADCAST, ADM_TOPUPS, ADM_STATS, ADM_PAYMENTS, ADM_BACK}
 
 
 def main_menu(admin: bool = False):
@@ -183,6 +212,7 @@ def admin_menu():
     kb = [
         [{"text": ADM_PRODUCTS, "style": "success"}, {"text": ADM_BROADCAST, "style": "primary"}],
         [{"text": ADM_TOPUPS, "style": "primary"}, {"text": ADM_STATS, "style": "primary"}],
+        [{"text": ADM_PAYMENTS, "style": "success"}],
         [{"text": ADM_BACK, "style": "danger"}],
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -517,7 +547,7 @@ async def noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# PROFILE / HISTORY / SUPPORT / TOPUP
+# PROFILE / HISTORY / SUPPORT
 # ============================================================
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -580,24 +610,84 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+# ============================================================
+# USER TOPUP FLOW (with payment method selection)
+# ============================================================
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["state"] = "topup_amount"
-    info = html.escape(PAYMENT_INFO)
+    for k in ("topup_pmid", "topup_pm_name", "topup_min", "topup_amount"):
+        ctx.user_data.pop(k, None)
+    ctx.user_data.pop("state", None)
+
+    methods = await get_active_payment_methods()
+    if not methods:
+        await update.message.reply_text(
+            "💰 <b>Add Balance</b>\n\n"
+            "❌ No payment methods are available right now.\n\n"
+            "Please contact support.",
+            parse_mode="HTML",
+        )
+        return
+
+    kb = []
+    for m in methods:
+        kb.append([btn(
+            f"🏦 {m['name']} • min {fmt_price(m['min_amount'])} {CURRENCY}",
+            callback_data=f"tp:pick:{m['id']}",
+            style="primary",
+        )])
     await update.message.reply_text(
-        f"💰 <b>Add Balance</b>\n\n"
-        f"Send payment to:\n<code>{info}</code>\n\n"
+        "💰 <b>Add Balance</b>\n\n🏦 Select a payment method:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        pmid = int(q.data.split(":")[2])
+    except Exception:
+        await q.answer("Invalid.", show_alert=True)
+        return
+
+    m = await get_payment_method(pmid)
+    if not m or not m.get("is_active"):
+        await q.answer("This payment method is no longer available.", show_alert=True)
+        return
+
+    await q.answer()
+    ctx.user_data["topup_pmid"] = pmid
+    ctx.user_data["topup_pm_name"] = m["name"]
+    ctx.user_data["topup_min"] = float(m.get("min_amount") or 0)
+    ctx.user_data["state"] = "topup_amount"
+
+    await q.edit_message_text(
+        f"💰 <b>Add Balance — {html.escape(m['name'])}</b>\n\n"
+        f"📱 Send payment to:\n<code>{html.escape(m['number'])}</code>\n\n"
+        f"💵 <b>Minimum:</b> {fmt_price(m['min_amount'])} {CURRENCY}\n\n"
         f"Then send the <b>amount</b> you paid:",
         parse_mode="HTML",
     )
 
 
 async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    min_amt = float(ctx.user_data.get("topup_min", 0) or 0)
     try:
         amt = float(update.message.text.strip())
-        assert amt > 0
+        if amt <= 0:
+            raise ValueError
     except Exception:
         await update.message.reply_text("❌ Invalid amount. Send a positive number:")
         return
+
+    if amt < min_amt:
+        await update.message.reply_text(
+            f"❌ Minimum deposit for this method is <b>{fmt_price(min_amt)} {CURRENCY}</b>.\n"
+            f"Please send at least that amount:",
+            parse_mode="HTML",
+        )
+        return
+
     ctx.user_data["topup_amount"] = amt
     ctx.user_data["state"] = "topup_txn"
     await update.message.reply_text(
@@ -609,6 +699,9 @@ async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txn = update.message.text.strip()
     amt = ctx.user_data.pop("topup_amount", None)
+    pm_id = ctx.user_data.pop("topup_pmid", None)
+    pm_name = ctx.user_data.pop("topup_pm_name", "")
+    ctx.user_data.pop("topup_min", None)
     ctx.user_data.pop("state", None)
     uid = update.effective_user.id
 
@@ -619,12 +712,25 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await sb(supabase.table("topup_requests").insert({
+    base_data = {
         "user_id": uid, "amount": amt, "txn_id": txn, "status": "pending",
-    }))
+    }
+    full_data = dict(base_data)
+    if pm_id:
+        full_data["payment_method_id"] = pm_id
+    if pm_name:
+        full_data["payment_method_name"] = pm_name
 
+    try:
+        await sb(supabase.table("topup_requests").insert(full_data))
+    except Exception as e:
+        log.warning(f"topup insert with pm info failed: {e}, retrying minimal")
+        await sb(supabase.table("topup_requests").insert(base_data))
+
+    method_line = f"🏦 Method: {html.escape(pm_name)}\n" if pm_name else ""
     await update.message.reply_text(
         f"✅ <b>Topup request submitted!</b>\n\n"
+        f"{method_line}"
         f"Amount: {amt} {CURRENCY}\n"
         f"TrxID: <code>{html.escape(txn)}</code>\n\n"
         f"Admin will verify and credit shortly.",
@@ -638,6 +744,7 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 aid,
                 f"💳 <b>New Topup</b>\n"
                 f"User: <code>{uid}</code>\n"
+                f"{method_line}"
                 f"Amount: {amt} {CURRENCY}\n"
                 f"TrxID: <code>{html.escape(txn)}</code>\n\n"
                 f"Go to ⚙️ Admin Panel → 💳 Pending Topups",
@@ -792,6 +899,8 @@ async def build_topup_detail_view(tid: int, page_hint: int = 1):
 
     t = r.data[0]
     status = (t.get("status") or "").lower()
+    pm_name = t.get("payment_method_name") or ""
+    pm_line = f"🏦 Method: <b>{html.escape(pm_name)}</b>\n" if pm_name else ""
 
     if status != "pending":
         uname_map = await get_usernames_batch([int(t["user_id"])])
@@ -800,6 +909,7 @@ async def build_topup_detail_view(tid: int, page_hint: int = 1):
         text = (
             f"💳 <b>Topup #{t['id']}</b>\n\n"
             f"👤 User: @{html.escape(uname)}\n"
+            f"{pm_line}"
             f"💰 Amount: {fmt_price(t['amount'])} {CURRENCY}\n"
             f"📌 Status: <b>{status.upper()}</b>\n"
         )
@@ -815,6 +925,7 @@ async def build_topup_detail_view(tid: int, page_hint: int = 1):
         f"💳 <b>Topup #{t['id']}</b>\n\n"
         f"👤 User: <a href=\"tg://user?id={t['user_id']}\">@{html.escape(uname)}</a>\n"
         f"🆔 ID: <code>{t['user_id']}</code>\n"
+        f"{pm_line}"
         f"💰 Amount: <b>{fmt_price(t['amount'])} {CURRENCY}</b>\n"
         f"📝 TrxID: <code>{html.escape(str(t.get('txn_id') or '—'))}</code>\n"
         f"📅 Date: {(t.get('created_at') or '')[:16].replace('T', ' ')}\n\n"
@@ -890,7 +1001,6 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     data = q.data
 
-    # Cancel reject flow
     if data == "tup:rejcancel":
         tid = ctx.user_data.pop("reject_topup_id", None)
         ctx.user_data.pop("state", None)
@@ -982,6 +1092,285 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# ADMIN — PAYMENT METHODS
+# ============================================================
+async def build_payment_methods_view():
+    methods = await get_all_payment_methods()
+    if not methods:
+        kb = [
+            [btn("➕ Add Payment Method", callback_data="pm:new", style="success")],
+            [btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")],
+        ]
+        return "🏦 <b>Payment Methods</b>\n\nNo methods yet.\n\nAdd your first method:", InlineKeyboardMarkup(kb)
+
+    kb = []
+    for m in methods:
+        emoji = "🟢" if m.get("is_active") else "🔴"
+        kb.append([btn(
+            f"{emoji} {m['name']} • {m['number']} • min {fmt_price(m['min_amount'])} {CURRENCY}",
+            callback_data=f"pm:view:{m['id']}",
+            style="success" if m.get("is_active") else "danger",
+        )])
+    kb.append([btn("➕ Add Payment Method", callback_data="pm:new", style="success")])
+    kb.append([btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")])
+    return f"🏦 <b>Payment Methods</b> ({len(methods)})\n\nClick a method to manage:", InlineKeyboardMarkup(kb)
+
+
+async def show_payment_method_detail(target, pmid, is_callback=True):
+    m = await get_payment_method(pmid)
+    if not m:
+        text = "Method not found."
+        kb = InlineKeyboardMarkup([[btn("⬅️ Back", callback_data="pm:list", style="primary")]])
+    else:
+        status = "🟢 Active" if m.get("is_active") else "🔴 Paused"
+        text = (
+            f"🏦 <b>{html.escape(m['name'])}</b>\n\n"
+            f"📱 Number: <code>{html.escape(m['number'])}</code>\n"
+            f"💰 Min Amount: <b>{fmt_price(m['min_amount'])} {CURRENCY}</b>\n"
+            f"📌 Status: {status}\n\n"
+            f"Manage this method:"
+        )
+        toggle_text = "⏸️ Pause (Hide from Users)" if m.get("is_active") else "▶️ Resume (Show to Users)"
+        toggle_style = "danger" if m.get("is_active") else "success"
+        kb = InlineKeyboardMarkup([
+            [btn(toggle_text, callback_data=f"pm:toggle:{pmid}", style=toggle_style)],
+            [btn("✏️ Edit Name", callback_data=f"pm:ename:{pmid}", style="primary"),
+             btn("📱 Edit Number", callback_data=f"pm:enum:{pmid}", style="primary")],
+            [btn("💰 Edit Min Amount", callback_data=f"pm:emin:{pmid}", style="primary")],
+            [btn("🗑️ Delete Method", callback_data=f"pm:delconf:{pmid}", style="danger")],
+            [btn("⬅️ Back to List", callback_data="pm:list", style="primary")],
+        ])
+    if is_callback:
+        await target.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await target.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def adm_btn_payments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    text, kbd = await build_payment_methods_view()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kbd)
+
+
+async def pm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Admin only.", show_alert=True)
+        return
+    data = q.data
+
+    if data == "pm:list":
+        await q.answer()
+        text, kb = await build_payment_methods_view()
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif data == "pm:new":
+        await q.answer()
+        ctx.user_data["state"] = "pm_new_name"
+        await q.edit_message_text(
+            "➕ <b>Add Payment Method</b>\n\n"
+            "Step 1/3 — Send the method <b>name</b> (e.g., bKash, Nagad):",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("pm:view:"):
+        await q.answer()
+        pmid = int(data.split(":")[2])
+        await show_payment_method_detail(q, pmid, is_callback=True)
+
+    elif data.startswith("pm:toggle:"):
+        pmid = int(data.split(":")[2])
+        m = await get_payment_method(pmid)
+        if not m:
+            await q.answer("Method not found.", show_alert=True)
+            return
+        new_active = not m.get("is_active", True)
+        await sb(supabase.table("payment_methods").update({"is_active": new_active}).eq("id", pmid))
+        await q.answer("✅ Resumed! Visible to users." if new_active else "⏸️ Paused! Hidden from users.", show_alert=False)
+        await show_payment_method_detail(q, pmid, is_callback=True)
+
+    elif data.startswith("pm:ename:"):
+        await q.answer()
+        pmid = int(data.split(":")[2])
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_name"
+        await q.edit_message_text("✏️ Send the new <b>method name</b>:", parse_mode="HTML")
+
+    elif data.startswith("pm:enum:"):
+        await q.answer()
+        pmid = int(data.split(":")[2])
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_number"
+        await q.edit_message_text("📱 Send the new <b>payment number</b>:", parse_mode="HTML")
+
+    elif data.startswith("pm:emin:"):
+        await q.answer()
+        pmid = int(data.split(":")[2])
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_min"
+        await q.edit_message_text("💰 Send the new <b>minimum deposit amount</b>:", parse_mode="HTML")
+
+    elif data.startswith("pm:delconf:"):
+        await q.answer()
+        pmid = int(data.split(":")[2])
+        m = await get_payment_method(pmid)
+        if not m:
+            await q.answer("Not found.", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup([[
+            btn("✅ Yes, Delete", callback_data=f"pm:delyes:{pmid}", style="danger"),
+            btn("❌ Cancel", callback_data=f"pm:view:{pmid}", style="primary"),
+        ]])
+        await q.edit_message_text(
+            f"⚠️ <b>Delete Payment Method?</b>\n\n"
+            f"<b>{html.escape(m['name'])}</b>\n"
+            f"Number: <code>{html.escape(m['number'])}</code>\n\n"
+            f"This cannot be undone.",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    elif data.startswith("pm:delyes:"):
+        await q.answer("Deleting...")
+        pmid = int(data.split(":")[2])
+        try:
+            await sb(supabase.table("payment_methods").delete().eq("id", pmid))
+        except Exception as e:
+            await q.edit_message_text(f"❌ Error: {html.escape(str(e))}")
+            return
+        text, kb = await build_payment_methods_view()
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    else:
+        await q.answer()
+
+
+# ---- Add Payment Method state handlers ----
+async def pm_new_name_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Invalid name. Try again:")
+        return
+    ctx.user_data["pm_name"] = name
+    ctx.user_data["state"] = "pm_new_number"
+    await update.message.reply_text(
+        "Step 2/3 — Send the <b>payment number</b> (e.g., 01XXXXXXXXX):",
+        parse_mode="HTML",
+    )
+
+
+async def pm_new_number_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    number = update.message.text.strip()
+    if not number:
+        await update.message.reply_text("❌ Invalid number. Try again:")
+        return
+    ctx.user_data["pm_number"] = number
+    ctx.user_data["state"] = "pm_new_min"
+    await update.message.reply_text(
+        "Step 3/3 — Send the <b>minimum deposit amount</b> (e.g., 50):",
+        parse_mode="HTML",
+    )
+
+
+async def pm_new_min_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        min_amt = float(update.message.text.strip())
+        if min_amt < 0:
+            min_amt = 0.0
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Send a number:")
+        return
+
+    name = ctx.user_data.pop("pm_name", None)
+    number = ctx.user_data.pop("pm_number", None)
+    ctx.user_data.pop("state", None)
+
+    if not name or not number:
+        await update.message.reply_text("Session lost. Try again.", reply_markup=admin_menu())
+        return
+
+    try:
+        await sb(supabase.table("payment_methods").insert({
+            "name": name, "number": number, "min_amount": min_amt, "is_active": True,
+        }))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {html.escape(str(e))}", reply_markup=admin_menu())
+        return
+
+    await update.message.reply_text(
+        f"✅ Payment method <b>{html.escape(name)}</b> added!",
+        parse_mode="HTML",
+    )
+    text, kb = await build_payment_methods_view()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---- Edit Payment Method state handlers ----
+async def pm_edit_name_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pmid = ctx.user_data.pop("pm_edit_id", None)
+    ctx.user_data.pop("state", None)
+    if not pmid:
+        await update.message.reply_text("Session expired.")
+        return
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Invalid name. Try again:")
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_name"
+        return
+    await sb(supabase.table("payment_methods").update({"name": name}).eq("id", pmid))
+    await update.message.reply_text(f"✅ Name updated to <b>{html.escape(name)}</b>", parse_mode="HTML")
+    await show_payment_method_detail(update.message, pmid, is_callback=False)
+
+
+async def pm_edit_number_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pmid = ctx.user_data.pop("pm_edit_id", None)
+    ctx.user_data.pop("state", None)
+    if not pmid:
+        await update.message.reply_text("Session expired.")
+        return
+    number = update.message.text.strip()
+    if not number:
+        await update.message.reply_text("❌ Invalid number. Try again:")
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_number"
+        return
+    await sb(supabase.table("payment_methods").update({"number": number}).eq("id", pmid))
+    await update.message.reply_text(f"✅ Number updated to <code>{html.escape(number)}</code>", parse_mode="HTML")
+    await show_payment_method_detail(update.message, pmid, is_callback=False)
+
+
+async def pm_edit_min_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pmid = ctx.user_data.pop("pm_edit_id", None)
+    ctx.user_data.pop("state", None)
+    if not pmid:
+        await update.message.reply_text("Session expired.")
+        return
+    try:
+        min_amt = float(update.message.text.strip())
+        if min_amt < 0:
+            min_amt = 0.0
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Try again:")
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_min"
+        return
+    await sb(supabase.table("payment_methods").update({"min_amount": min_amt}).eq("id", pmid))
+    await update.message.reply_text(
+        f"✅ Min amount updated to <b>{fmt_price(min_amt)} {CURRENCY}</b>",
+        parse_mode="HTML",
+    )
+    await show_payment_method_detail(update.message, pmid, is_callback=False)
+
+
+# ============================================================
 # ADMIN — text-menu entry points
 # ============================================================
 async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1017,12 +1406,14 @@ async def adm_btn_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     p = await sb(supabase.table("products").select("id", count="exact").eq("is_active", True))
     o = await sb(supabase.table("orders").select("id", count="exact"))
     tp = await sb(supabase.table("topup_requests").select("id", count="exact").eq("status", "pending"))
+    pm = await sb(supabase.table("payment_methods").select("id", count="exact").eq("is_active", True))
     await update.message.reply_text(
         f"📊 <b>Stats</b>\n\n"
         f"👥 Users: {u.count or 0}\n"
         f"📦 Products: {p.count or 0}\n"
         f"🛒 Orders: {o.count or 0}\n"
-        f"⏳ Pending Topups: {tp.count or 0}",
+        f"⏳ Pending Topups: {tp.count or 0}\n"
+        f"🏦 Active Payment Methods: {pm.count or 0}",
         parse_mode="HTML",
         reply_markup=admin_menu(),
     )
@@ -1333,6 +1724,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await adm_btn_topups(update, ctx)
         if text == ADM_STATS:
             return await adm_btn_stats(update, ctx)
+        if text == ADM_PAYMENTS:
+            return await adm_btn_payments(update, ctx)
         if text == ADM_BACK:
             ctx.user_data["in_admin"] = False
             await update.message.reply_text(
@@ -1381,6 +1774,18 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await adm_broadcast_handler(update, ctx)
     if state == "adm_topup_reject":
         return await adm_topup_reject_reason_handler(update, ctx)
+    if state == "pm_new_name":
+        return await pm_new_name_handler(update, ctx)
+    if state == "pm_new_number":
+        return await pm_new_number_handler(update, ctx)
+    if state == "pm_new_min":
+        return await pm_new_min_handler(update, ctx)
+    if state == "pm_edit_name":
+        return await pm_edit_name_handler(update, ctx)
+    if state == "pm_edit_number":
+        return await pm_edit_number_handler(update, ctx)
+    if state == "pm_edit_min":
+        return await pm_edit_min_handler(update, ctx)
 
     kb = admin_menu() if (user_is_admin and ctx.user_data.get("in_admin")) else main_menu(user_is_admin)
     await update.message.reply_text("Unknown option. Use the menu.", reply_markup=kb)
@@ -1416,7 +1821,9 @@ async def main():
     app.add_handler(CallbackQueryHandler(back_cats, pattern="^back_cats$"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
 
+    app.add_handler(CallbackQueryHandler(topup_pick_callback, pattern="^tp:pick:"))
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
+    app.add_handler(CallbackQueryHandler(pm_callback, pattern="^pm:"))
     app.add_handler(CallbackQueryHandler(adm_callback, pattern="^adm:"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
