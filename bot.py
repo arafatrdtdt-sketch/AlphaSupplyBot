@@ -299,7 +299,7 @@ def build_quantity_view(product, qty):
                 btn(f"🛒 {qty}", callback_data=f"qty:info:{product['id']}", style="success"),
                 btn("+", callback_data=f"qty:inc:{product['id']}:{qty}", style="primary"),
             ],
-            [btn("✏️ Enter Quantity Manually", callback_data=f"qty:manual:{product['id']}", style="primary")],
+            [btn("✏️ Enter Quantity", callback_data=f"qty:manual:{product['id']}", style="primary")],
             [btn("✅ Confirm & Buy", callback_data=f"qty:buy:{product['id']}:{qty}", style="success")],
             [btn("⬅️ Back", callback_data=f"cat:{product['category']}", style="danger")],
         ]
