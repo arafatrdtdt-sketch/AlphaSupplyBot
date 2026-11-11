@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 import logging
 from dotenv import load_dotenv
@@ -202,24 +203,60 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     r = await sb(supabase.table("orders").select("id", count="exact").eq("user_id", uid))
     count = r.count or 0
     joined = (u.get("created_at") or "")[:10]
+    uname = u.get("username")
+    uname_text = f"@{html.escape(uname)}" if uname else "—"
+    fname = html.escape(u.get("first_name") or "-")
     await update.message.reply_text(
-        f"👤 *Profile*\n\n"
-        f"🆔 `{uid}`\n"
-        f"👤 {u.get('first_name') or '-'}\n"
-        f"🔗 @{u.get('username') or '-'}\n"
-        f"💰 Balance: *{u['balance']} {CURRENCY}*\n"
+        f"👤 <b>Profile</b>\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"👤 {fname}\n"
+        f"🔗 {uname_text}\n"
+        f"💰 Balance: <b>{u['balance']} {CURRENCY}</b>\n"
         f"🧾 Orders: {count}\n"
         f"📅 Joined: {joined}",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
+
+
+async def show_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    contact = html.escape(SUPPORT_CONTACT)
+    await update.message.reply_text(
+        f"🆘 <b>Support</b>\n\n"
+        f"Contact: {contact}\n"
+        f"We usually reply within a few hours.",
+        parse_mode="HTML",
+    )
+
+
+async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    r = await sb(
+        supabase.table("transactions").select("*")
+        .eq("user_id", uid).order("created_at", desc=True).limit(20)
+    )
+    txs = r.data or []
+    if not txs:
+        await update.message.reply_text("📜 No transactions yet.")
+        return
+    lines = ["📜 <b>Transaction History</b>\n"]
+    for t in txs:
+        sign = "+" if t["amount"] >= 0 else ""
+        emoji = {"topup": "💰", "purchase": "🛒", "refund": "↩️", "admin_adjust": "⚙️"}.get(t["type"], "•")
+        dt = (t.get("created_at") or "")[:16].replace("T", " ")
+        lines.append(
+            f"{emoji} <code>{sign}{t['amount']}</code> {CURRENCY} • {html.escape(t['type'])}\n"
+            f"   <i>{dt}</i> • Bal: {t['balance_after']}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["state"] = "topup_amount"
+    info = html.escape(PAYMENT_INFO)
     await update.message.reply_text(
-        f"💰 *Add Balance*\n\n"
-        f"Send payment to:\n`{PAYMENT_INFO}`\n\n"
-        f"Then send the *amount* you paid:",
-        parse_mode="Markdown",
+        f"💰 <b>Add Balance</b>\n\n"
+        f"Send payment to:\n<code>{info}</code>\n\n"
+        f"Then send the <b>amount</b> you paid:",
+        parse_mode="HTML",
     )
 
 async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -233,32 +270,15 @@ async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["state"] = "topup_txn"
     await update.message.reply_text("Now send *Transaction ID (TrxID)*:", parse_mode="Markdown")
 
-async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txn = update.message.text.strip()
-    amt = ctx.user_data.pop("topup_amount", None)
-    ctx.user_data.pop("state", None)
-    uid = update.effective_user.id
-    if not amt:
-        await update.message.reply_text("Something went wrong. Try again.", reply_markup=main_menu(is_admin(uid)))
-        return
-    await sb(supabase.table("topup_requests").insert({
-        "user_id": uid, "amount": amt, "txn_id": txn, "status": "pending",
-    }))
-    await update.message.reply_text(
-        f"✅ *Topup request submitted!*\n\n"
-        f"Amount: {amt} {CURRENCY}\n"
-        f"TrxID: `{txn}`\n\n"
-        f"Admin will verify and credit shortly.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(is_admin(uid)),
-    )
-    for aid in ADMIN_IDS:
         try:
             await ctx.bot.send_message(
                 aid,
-                f"💳 *New Topup*\nUser: `{uid}`\nAmount: {amt} {CURRENCY}\nTrxID: `{txn}`\n\n"
+                f"💳 <b>New Topup</b>\n"
+                f"User: <code>{uid}</code>\n"
+                f"Amount: {amt} {CURRENCY}\n"
+                f"TrxID: <code>{html.escape(txn)}</code>\n\n"
                 f"Go to ⚙️ Admin Panel → 💳 Pending Topups",
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
         except Exception:
             pass
