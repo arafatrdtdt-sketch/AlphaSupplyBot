@@ -235,7 +235,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )])
     kb.append([btn("⬅️ Back", callback_data="back_cats", style="danger")])
     await q.edit_message_text(
-        f"📦 Please select a <b>{html.escape(cat.title())}</b>",
+        f"📦 Please choose a <b>{html.escape(cat.title())}</b> from this list",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
