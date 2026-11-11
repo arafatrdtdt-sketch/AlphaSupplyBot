@@ -613,7 +613,11 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# USER TOPUP FLOW (with payment method selection + COPY BUTTON)
+# USER TOPUP FLOW
+#   1) Ask amount
+#   2) Show eligible payment methods (min_amount <= amt)
+#   3) Show exact amount + number (copy button)
+#   4) Ask TrxID
 # ============================================================
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in ("topup_pmid", "topup_pm_name", "topup_min", "topup_amount"):
@@ -630,15 +634,56 @@ async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    ctx.user_data["state"] = "topup_amount_first"
+    await update.message.reply_text(
+        "💰 <b>Add Balance</b>\n\n"
+        "💵 How much do you want to add?\n\n"
+        "Send the <b>amount</b> in numbers (e.g., 100):",
+        parse_mode="HTML",
+    )
+
+
+async def topup_amount_first_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        amt = float(update.message.text.strip())
+        if amt <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("❌ Invalid amount. Send a positive number:")
+        return
+
+    methods = await get_active_payment_methods()
+    eligible = [m for m in methods if float(m.get("min_amount") or 0) <= amt]
+
+    if not eligible:
+        if methods:
+            min_possible = min(float(m.get("min_amount") or 0) for m in methods)
+            await update.message.reply_text(
+                f"❌ No payment method available for <b>{fmt_price(amt)} {CURRENCY}</b>.\n\n"
+                f"💵 Minimum deposit is <b>{fmt_price(min_possible)} {CURRENCY}</b>.\n\n"
+                f"Please send a higher amount:",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text("❌ No payment methods available right now.")
+            ctx.user_data.pop("state", None)
+        return
+
+    ctx.user_data["topup_amount"] = amt
+    ctx.user_data.pop("state", None)
+
     kb = []
-    for m in methods:
+    for m in eligible:
         kb.append([btn(
-            f"{m['name']}",
+            f"🏦 {m['name']}",
             callback_data=f"tp:pick:{m['id']}",
             style="primary",
         )])
+
     await update.message.reply_text(
-        "💰 <b>Add Balance</b>\n\n🏦 Select a payment method:",
+        f"💰 <b>Add Balance</b>\n\n"
+        f"💵 Amount: <b>{fmt_price(amt)} {CURRENCY}</b>\n\n"
+        f"🏦 Select a payment method to continue:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -652,58 +697,49 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Invalid.", show_alert=True)
         return
 
+    amt = ctx.user_data.get("topup_amount")
+    if not amt:
+        await q.answer("Session expired. Start again.", show_alert=True)
+        try:
+            await q.edit_message_text("⚠️ Session expired. Please tap 💰 Add Balance again.")
+        except Exception:
+            pass
+        return
+
     m = await get_payment_method(pmid)
     if not m or not m.get("is_active"):
         await q.answer("This payment method is no longer available.", show_alert=True)
         return
 
-    await q.answer()
-    ctx.user_data["topup_pmid"] = pmid
-    ctx.user_data["topup_pm_name"] = m["name"]
-    ctx.user_data["topup_min"] = float(m.get("min_amount") or 0)
-    ctx.user_data["state"] = "topup_amount"
-
-    number_str = str(m["number"]).strip()
-
-    # ✅ Number copy button (OTP bot er moto)
-    kb = InlineKeyboardMarkup([
-        [btn(f"📋 {number_str}", copy_text=number_str, style="success")],
-    ])
-
-    await q.edit_message_text(
-        f"💰 <b>Add Balance — {html.escape(m['name'])}</b>\n\n"
-        f"📱 Send payment to:\n<code>{html.escape(number_str)}</code>\n\n"
-        f"💵 <b>Minimum:</b> {fmt_price(m['min_amount'])} {CURRENCY}\n\n"
-        f"👇 Tap the button below to <b>copy the number</b>.\n\n"
-        f"Then send the <b>amount</b> you paid:",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-
-
-async def topup_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    min_amt = float(ctx.user_data.get("topup_min", 0) or 0)
-    try:
-        amt = float(update.message.text.strip())
-        if amt <= 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("❌ Invalid amount. Send a positive number:")
-        return
-
+    min_amt = float(m.get("min_amount") or 0)
     if amt < min_amt:
-        await update.message.reply_text(
-            f"❌ Minimum deposit for this method is <b>{fmt_price(min_amt)} {CURRENCY}</b>.\n"
-            f"Please send at least that amount:",
-            parse_mode="HTML",
+        await q.answer(
+            f"Minimum for {m['name']} is {fmt_price(min_amt)} {CURRENCY}.",
+            show_alert=True,
         )
         return
 
-    ctx.user_data["topup_amount"] = amt
+    await q.answer()
+    ctx.user_data["topup_pmid"] = pmid
+    ctx.user_data["topup_pm_name"] = m["name"]
+    ctx.user_data["topup_min"] = min_amt
     ctx.user_data["state"] = "topup_txn"
-    await update.message.reply_text(
-        "Now send <b>Transaction ID (TrxID)</b>:",
+
+    number_str = str(m["number"]).strip()
+
+    kb = InlineKeyboardMarkup([
+        [btn(f"{number_str}", copy_text=number_str, style="success")],
+    ])
+
+    await q.edit_message_text(
+        f"💳 <b>Pay {fmt_price(amt)} {CURRENCY}</b>\n\n"
+        f"🏦 Method: <b>{html.escape(m['name'])}</b>\n\n"
+        f"📱 Send <b>exactly {fmt_price(amt)} {CURRENCY}</b> to:\n"
+        f"<code>{html.escape(number_str)}</code>\n\n"
+        f"👇 Tap the button below to <b>copy the number</b>.\n\n"
+        f"✅ After payment, send the <b>Transaction ID (TrxID)</b>:",
         parse_mode="HTML",
+        reply_markup=kb,
     )
 
 
@@ -742,7 +778,7 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ <b>Topup request submitted!</b>\n\n"
         f"{method_line}"
-        f"Amount: {amt} {CURRENCY}\n"
+        f"Amount: {fmt_price(amt)} {CURRENCY}\n"
         f"TrxID: <code>{html.escape(txn)}</code>\n\n"
         f"Admin will verify and credit shortly.",
         parse_mode="HTML",
@@ -756,7 +792,7 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"💳 <b>New Topup</b>\n"
                 f"User: <code>{uid}</code>\n"
                 f"{method_line}"
-                f"Amount: {amt} {CURRENCY}\n"
+                f"Amount: {fmt_price(amt)} {CURRENCY}\n"
                 f"TrxID: <code>{html.escape(txn)}</code>\n\n"
                 f"Go to ⚙️ Admin Panel → 💳 Pending Topups",
                 parse_mode="HTML",
@@ -844,7 +880,7 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
 
 
 # ============================================================
-# ADMIN — PENDING TOPUPS (paginated list + detail + reject flow)
+# ADMIN — PENDING TOPUPS
 # ============================================================
 TOPUPS_PER_PAGE = 10
 
@@ -1763,8 +1799,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await show_support(update, ctx)
         return
 
-    if state == "topup_amount":
-        return await topup_amount_handler(update, ctx)
+    if state == "topup_amount_first":
+        return await topup_amount_first_handler(update, ctx)
     if state == "topup_txn":
         return await topup_txn_handler(update, ctx)
     if state == "qty_manual":
