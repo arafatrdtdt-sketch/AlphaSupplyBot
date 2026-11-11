@@ -227,7 +227,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for p in products:
         in_stock = p["stock"] > 0
-        emoji = "🟢" if in_stock else "🔴"
+        emoji = "" if in_stock else ""
         kb.append([btn(
             f"{emoji} {p['name']} — {p['price']} {CURRENCY}",
             callback_data=f"prod:{p['id']}",
