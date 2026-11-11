@@ -45,7 +45,7 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 
-def btn(text, callback_data=None, url=None, style=None):
+def btn(text, callback_data=None, url=None, style=None, copy_text=None):
     b = {"text": str(text)}
     if callback_data:
         b["callback_data"] = callback_data
@@ -53,6 +53,8 @@ def btn(text, callback_data=None, url=None, style=None):
         b["url"] = url
     if style:
         b["style"] = style
+    if copy_text:
+        b["copy_text"] = {"text": str(copy_text)}
     return b
 
 
@@ -611,7 +613,7 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# USER TOPUP FLOW (with payment method selection)
+# USER TOPUP FLOW (with payment method selection + COPY BUTTON)
 # ============================================================
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in ("topup_pmid", "topup_pm_name", "topup_min", "topup_amount"):
@@ -661,12 +663,21 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["topup_min"] = float(m.get("min_amount") or 0)
     ctx.user_data["state"] = "topup_amount"
 
+    number_str = str(m["number"]).strip()
+
+    # ✅ Number copy button (OTP bot er moto)
+    kb = InlineKeyboardMarkup([
+        [btn(f"📋 {number_str}", copy_text=number_str, style="success")],
+    ])
+
     await q.edit_message_text(
         f"💰 <b>Add Balance — {html.escape(m['name'])}</b>\n\n"
-        f"📱 Send payment to:\n<code>{html.escape(m['number'])}</code>\n\n"
+        f"📱 Send payment to:\n<code>{html.escape(number_str)}</code>\n\n"
         f"💵 <b>Minimum:</b> {fmt_price(m['min_amount'])} {CURRENCY}\n\n"
+        f"👇 Tap the button below to <b>copy the number</b>.\n\n"
         f"Then send the <b>amount</b> you paid:",
         parse_mode="HTML",
+        reply_markup=kb,
     )
 
 
