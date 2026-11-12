@@ -1119,9 +1119,7 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ])
 
     await q.edit_message_text(
-        f"💳 <b>Pay {fmt_price(amt)} {CURRENCY}</b>\n\n"
-        f"🏦 Method: <b>{html.escape(m['name'])}</b>\n\n"
-        f"📱 Send <b>exactly {fmt_price(amt)} {CURRENCY}</b> to:\n"
+        f"💳 Pay <b>exactly {fmt_price(amt)} {CURRENCY}</b> via <b>{html.escape(m['name'])}</b> to:\n"
         f"<code>{html.escape(number_str)}</code>\n\n"
         f"👇 Tap the button below to <b>copy the number</b>.\n\n"
         f"✅ After payment, tap <b>I've Paid</b>.",
@@ -1217,10 +1215,10 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     # New Button Layout: Request Manual Review on top, Cancel and Try Again side-by-side
     kb = InlineKeyboardMarkup([
-        [btn("📞 Request for Manual Review", callback_data=f"tup:mreview:{txn}", style="danger")],
+        [btn("📞 Request for Manual Review", callback_data=f"tup:mreview:{txn}", style="primary")],
         [
             btn("❌ Cancel", callback_data="tup:cancel", style="danger"),
-            btn("🔄 Try Again", callback_data="tup:try_again", style="primary")
+            btn("🔄 Try Again", callback_data="tup:try_again", style="success")
         ]
     ])
     
