@@ -1000,7 +1000,7 @@ async def hist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# USER TOPUP FLOW
+# USER TOPUP FLOW (NEW UI + AUTO VERIFY)
 # ============================================================
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in ("topup_pmid", "topup_pm_name", "topup_min", "topup_amount"):
@@ -1106,12 +1106,17 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["topup_pmid"] = pmid
     ctx.user_data["topup_pm_name"] = m["name"]
     ctx.user_data["topup_min"] = min_amt
-    ctx.user_data["state"] = "topup_txn"
+    ctx.user_data.pop("state", None) # Not asking for txn yet
 
     number_str = str(m["number"]).strip()
 
+    # New Copy, Cancel, I've Paid buttons
     kb = InlineKeyboardMarkup([
-        [btn(f"{number_str}", copy_text=number_str, style="success")],
+        [btn(f"📋 {number_str}", copy_text=number_str, style="success")],
+        [
+            btn("❌ Cancel", callback_data="tup:cancel", style="danger"),
+            btn("✅ I've Paid", callback_data="tup:paid", style="primary")
+        ]
     ])
 
     await q.edit_message_text(
@@ -1120,86 +1125,236 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📱 Send <b>exactly {fmt_price(amt)} {CURRENCY}</b> to:\n"
         f"<code>{html.escape(number_str)}</code>\n\n"
         f"👇 Tap the button below to <b>copy the number</b>.\n\n"
-        f"✅ After payment, send the <b>Transaction ID (TrxID)</b>:",
+        f"✅ After payment, tap <b>I've Paid</b>.",
         parse_mode="HTML",
         reply_markup=kb,
     )
 
 
-async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txn = update.message.text.strip()
-    amt = ctx.user_data.pop("topup_amount", None)
-    pm_id = ctx.user_data.pop("topup_pmid", None)
-    pm_name = ctx.user_data.pop("topup_pm_name", "")
-    ctx.user_data.pop("topup_min", None)
-    ctx.user_data.pop("state", None)
-    uid = update.effective_user.id
-
-    if not amt:
-        await update.message.reply_text(
-            "Something went wrong. Try again.",
-            reply_markup=main_menu(is_admin(uid)),
-        )
-        return
-
-    base_data = {
-        "user_id": uid, "amount": amt, "txn_id": txn, "status": "pending",
-    }
-    full_data = dict(base_data)
-    if pm_id:
-        full_data["payment_method_id"] = pm_id
-    if pm_name:
-        full_data["payment_method_name"] = pm_name
-
-    tid = None
+async def topup_cancel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.clear()
     try:
-        r = await sb(supabase.table("topup_requests").insert(full_data))
-        if r.data:
-            tid = r.data[0]["id"]
-    except Exception as e:
-        log.warning(f"topup insert with pm info failed: {e}, retrying minimal")
-        try:
-            r = await sb(supabase.table("topup_requests").insert(base_data))
-            if r.data:
-                tid = r.data[0]["id"]
-        except Exception as e2:
-            log.error(f"topup minimal insert failed: {e2}")
+        await q.edit_message_text("❌ Topup cancelled.")
+    except Exception:
+        pass
 
-    method_line = f"🏦 Method: {html.escape(pm_name)}\n" if pm_name else ""
-    await update.message.reply_text(
-        f"✅ <b>Topup request submitted!</b>\n\n"
-        f"{method_line}"
-        f"Amount: {fmt_price(amt)} {CURRENCY}\n"
-        f"TrxID: <code>{html.escape(txn)}</code>\n\n"
-        f"Admin will verify and credit shortly.",
-        parse_mode="HTML",
-        reply_markup=main_menu(is_admin(uid)),
+
+async def topup_paid_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    ctx.user_data["state"] = "topup_txn"
+    await q.edit_message_text(
+        "✅ <b>Please send your Transaction ID (TrxID)</b>\n\n"
+        "You can find this in your bKash/Nagad confirmation SMS.",
+        parse_mode="HTML"
     )
 
-    if tid:
-        kb_view = InlineKeyboardMarkup([[
-            btn(
-                f"👁 View & Manage Topup #{tid}",
-                callback_data=f"tup:view:{tid}",
-                style="success",
-            ),
-        ]])
-    else:
-        kb_view = InlineKeyboardMarkup([[
-            btn("👁 View Pending Topups", callback_data="tup:page:1", style="primary"),
-        ]])
 
+# ---------------- SMS VERIFICATION LOGIC ----------------
+async def try_verify_payment(trx_id, amount, sms_sender):
+    """Search payment_sms table for matching trx_id."""
+    try:
+        r = await sb(
+            supabase.table("payment_sms").select("*")
+            .eq("trx_id", trx_id).eq("is_used", False).limit(1)
+        )
+        if not r.data:
+            return False
+        
+        sms = r.data[0]
+        # Verify amount (with small tolerance)
+        if abs(float(sms["amount"]) - float(amount)) > 0.01:
+            return False
+            
+        # Verify provider (bKash/Nagad) if configured in payment method
+        if sms_sender:
+            if sms.get("provider", "").lower() != sms_sender.lower():
+                return False
+                
+        return sms["id"]
+    except Exception as e:
+        log.error(f"verify_payment error: {e}")
+        return False
+
+
+async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txn = update.message.text.strip()
+    amt = ctx.user_data.get("topup_amount")
+    pm_id = ctx.user_data.get("topup_pmid")
+    pm_name = ctx.user_data.get("topup_pm_name", "")
+    uid = update.effective_user.id
+
+    if not amt or not pm_id:
+        await update.message.reply_text("Session expired. Please tap 💰 Add Balance again.", reply_markup=main_menu(is_admin(uid)))
+        ctx.user_data.clear()
+        return
+
+    m = await get_payment_method(pm_id)
+    sms_sender = m.get("sms_sender") if m else ""
+
+    # Prevent overlapping messages
+    if ctx.user_data.get("is_verifying"):
+        await update.message.reply_text("⏳ Please wait, still verifying...")
+        return
+    ctx.user_data["is_verifying"] = True
+
+    msg = await update.message.reply_text(
+        "⏳ <b>Verifying your payment please wait...</b>",
+        parse_mode="HTML"
+    )
+
+    # --- Try 1: 5 seconds ---
+    await asyncio.sleep(5)
+    sms_id = await try_verify_payment(txn, amt, sms_sender)
+    
+    if sms_id:
+        return await _complete_auto_topup(update, ctx, msg, sms_id, txn, amt, pm_id, pm_name, uid)
+
+    # --- Try 2: 20 more seconds ---
+    await msg.edit_text(
+        "⏳ <b>Payment verify hoyni, we are still trying...</b>\n\n"
+        "Please hold a while we verify the payment.",
+        parse_mode="HTML"
+    )
+    await asyncio.sleep(20)
+    sms_id = await try_verify_payment(txn, amt, sms_sender)
+
+    if sms_id:
+        return await _complete_auto_topup(update, ctx, msg, sms_id, txn, amt, pm_id, pm_name, uid)
+
+    # --- Failed ---
+    ctx.user_data["is_verifying"] = False
+    await msg.edit_text(
+        "❌ <b>Payment not found.</b>\n\n"
+        "Please check your SMS and send the correct <b>TrxID</b> again.\n"
+        "Or, if you are sure you paid, request a manual review.",
+        parse_mode="HTML"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [btn("📞 Request for Manual Review", callback_data=f"tup:mreview:{txn}", style="danger")],
+        [btn("❌ Cancel", callback_data="tup:cancel", style="primary")]
+    ])
+    await update.message.reply_text(
+        "👇 Choose an option below:",
+        reply_markup=kb
+    )
+
+
+async def _complete_auto_topup(update, ctx, msg, sms_id, txn, amt, pm_id, pm_name, uid):
+    ctx.user_data["is_verifying"] = False
+    ctx.user_data.pop("state", None)
+    ctx.user_data.pop("topup_amount", None)
+    ctx.user_data.pop("topup_pmid", None)
+    ctx.user_data.pop("topup_pm_name", None)
+
+    # 1. Mark SMS as used
+    try:
+        await sb(supabase.table("payment_sms").update({"is_used": True}).eq("id", sms_id))
+    except Exception as e:
+        log.error(f"Failed to mark sms used: {e}")
+
+    # 2. Insert Topup Request as approved
+    r = await sb(supabase.table("topup_requests").insert({
+        "user_id": uid, "amount": amt, "txn_id": txn, "status": "approved",
+        "payment_method_id": pm_id, "payment_method_name": pm_name
+    }))
+    tid = r.data[0]["id"] if r.data else None
+
+    # 3. Add Balance
+    user = await get_user(uid)
+    new_balance = float(user["balance"]) + float(amt)
+    await sb(supabase.table("users").update({"balance": new_balance}).eq("id", uid))
+
+    # 4. Add Transaction history
+    await sb(supabase.table("transactions").insert({
+        "user_id": uid, "type": "topup", "amount": amt,
+        "balance_after": new_balance, "reference": str(tid), "note": "Auto-verified topup"
+    }))
+    asyncio.create_task(trim_user_transactions(uid))
+
+    # 5. Success Message
+    await msg.edit_text(
+        f"✅ <b>Topup Successful!</b>\n\n"
+        f"Amount: <b>{fmt_price(amt)} {CURRENCY}</b>\n"
+        f"TrxID: <code>{html.escape(txn)}</code>\n"
+        f"💳 New Balance: <b>{fmt_price(new_balance)} {CURRENCY}</b>\n\n"
+        f"Thank you for your payment!",
+        parse_mode="HTML"
+    )
+    await update.effective_chat.send_message(
+        "Use the menu below to continue.",
+        reply_markup=main_menu(is_admin(uid))
+    )
+    
+    # Notify Admin (Optional)
     for aid in ADMIN_IDS:
         try:
             await ctx.bot.send_message(
                 aid,
-                f"💳 <b>New Topup</b>\n"
+                f"✅ <b>Auto-Verified Topup</b>\n"
                 f"User: <code>{uid}</code>\n"
-                f"{method_line}"
                 f"Amount: {fmt_price(amt)} {CURRENCY}\n"
                 f"TrxID: <code>{html.escape(txn)}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+async def tup_manual_review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    txn = q.data.split(":")[2]
+    uid = q.from_user.id
+    
+    amt = ctx.user_data.get("topup_amount")
+    pm_id = ctx.user_data.get("topup_pmid")
+    pm_name = ctx.user_data.get("topup_pm_name", "")
+    
+    ctx.user_data.clear()
+
+    if not amt or not pm_id:
+        await q.edit_message_text("⚠️ Session expired. Please start again.")
+        return
+
+    # Save to DB as pending
+    try:
+        r = await sb(supabase.table("topup_requests").insert({
+            "user_id": uid, "amount": amt, "txn_id": txn, "status": "pending",
+            "payment_method_id": pm_id, "payment_method_name": pm_name
+        }))
+        tid = r.data[0]["id"]
+    except Exception as e:
+        log.error(f"Manual review insert error: {e}")
+        await q.edit_message_text("❌ Something went wrong. Try again later.")
+        return
+
+    await q.edit_message_text(
+        f"✅ <b>Manual Review Requested</b>\n\n"
+        f"Amount: {fmt_price(amt)} {CURRENCY}\n"
+        f"TrxID: <code>{html.escape(txn)}</code>\n\n"
+        f"Admin will verify and credit your account shortly.",
+        parse_mode="HTML"
+    )
+    await q.message.reply_text("Main Menu:", reply_markup=main_menu(is_admin(uid)))
+
+    # Notify Admin
+    kb_view = InlineKeyboardMarkup([[btn(f"👁 View & Manage Topup #{tid}", callback_data=f"tup:view:{tid}", style="success")]])
+    for aid in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(
+                aid,
+                f"⚠️ <b>Manual Review Requested</b>\n"
+                f"User: <code>{uid}</code>\n"
+                f"Amount: {fmt_price(amt)} {CURRENCY}\n"
+                f"TrxID: <code>{html.escape(txn)}</code>\n\n"
+                f"Payment could not be auto-verified.",
                 parse_mode="HTML",
-                reply_markup=kb_view,
+                reply_markup=kb_view
             )
         except Exception:
             pass
@@ -1511,7 +1666,6 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning(f"refund txn insert failed: {e}")
 
-        # Trim after refund insert
         await trim_user_transactions(int(o["user_id"]))
 
         try:
@@ -1856,7 +2010,6 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
-            # Trim after RPC insert
             asyncio.create_task(trim_user_transactions(int(u["user_id"])))
         await q.answer("✅ Approved!", show_alert=False)
         text, kb = await build_topups_list_view(1)
@@ -1898,7 +2051,7 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ADMIN — PAYMENT METHODS
+# ADMIN — PAYMENT METHODS (Updated for SMS Sender)
 # ============================================================
 async def build_payment_methods_view():
     methods = await get_all_payment_methods()
@@ -1929,9 +2082,11 @@ async def show_payment_method_detail(target, pmid, is_callback=True):
         kb = InlineKeyboardMarkup([[btn("⬅️ Back", callback_data="pm:list", style="primary")]])
     else:
         status = "🟢 Active" if m.get("is_active") else "🔴 Paused"
+        sms_sender = m.get("sms_sender") or "Not Set"
         text = (
             f"🏦 <b>{html.escape(m['name'])}</b>\n\n"
             f"📱 Number: <code>{html.escape(m['number'])}</code>\n"
+            f"📨 SMS Sender: <code>{html.escape(sms_sender)}</code>\n"
             f"💰 Min Amount: <b>{fmt_price(m['min_amount'])} {CURRENCY}</b>\n"
             f"📌 Status: {status}\n\n"
             f"Manage this method:"
@@ -1942,6 +2097,7 @@ async def show_payment_method_detail(target, pmid, is_callback=True):
             [btn(toggle_text, callback_data=f"pm:toggle:{pmid}", style=toggle_style)],
             [btn("✏️ Edit Name", callback_data=f"pm:ename:{pmid}", style="primary"),
              btn("📱 Edit Number", callback_data=f"pm:enum:{pmid}", style="primary")],
+            [btn("📨 Edit SMS Sender", callback_data=f"pm:esender:{pmid}", style="primary")],
             [btn("💰 Edit Min Amount", callback_data=f"pm:emin:{pmid}", style="primary")],
             [btn("🗑️ Delete Method", callback_data=f"pm:delconf:{pmid}", style="danger")],
             [btn("⬅️ Back to List", callback_data="pm:list", style="primary")],
@@ -1979,7 +2135,7 @@ async def pm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["state"] = "pm_new_name"
         await q.edit_message_text(
             "➕ <b>Add Payment Method</b>\n\n"
-            "Step 1/3 — Send the method <b>name</b> (e.g., bKash, Nagad):",
+            "Step 1/4 — Send the method <b>name</b> (e.g., bKash, Nagad):",
             parse_mode="HTML",
         )
 
@@ -2012,6 +2168,13 @@ async def pm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["pm_edit_id"] = pmid
         ctx.user_data["state"] = "pm_edit_number"
         await q.edit_message_text("📱 Send the new <b>payment number</b>:", parse_mode="HTML")
+
+    elif data.startswith("pm:esender:"):
+        await q.answer()
+        pmid = int(data.split(":")[2])
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_sms_sender"
+        await q.edit_message_text("📨 Send the new <b>SMS Sender</b> (e.g., bKash, Nagad):", parse_mode="HTML")
 
     elif data.startswith("pm:emin:"):
         await q.answer()
@@ -2067,7 +2230,7 @@ async def pm_new_name_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["pm_name"] = name
     ctx.user_data["state"] = "pm_new_number"
     await update.message.reply_text(
-        "Step 2/3 — Send the <b>payment number</b> (e.g., 01XXXXXXXXX):",
+        "Step 2/4 — Send the <b>payment number</b> (e.g., 01XXXXXXXXX):",
         parse_mode="HTML",
     )
 
@@ -2078,9 +2241,23 @@ async def pm_new_number_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid number. Try again:")
         return
     ctx.user_data["pm_number"] = number
+    ctx.user_data["state"] = "pm_new_sms_sender"
+    await update.message.reply_text(
+        "Step 3/4 — Send the <b>SMS Sender</b> (e.g., bKash, Nagad) exact name.\n"
+        "This will be used to match the incoming SMS.",
+        parse_mode="HTML",
+    )
+
+
+async def pm_new_sms_sender_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sender = update.message.text.strip()
+    if not sender:
+        await update.message.reply_text("❌ Invalid sender. Try again:")
+        return
+    ctx.user_data["pm_sms_sender"] = sender
     ctx.user_data["state"] = "pm_new_min"
     await update.message.reply_text(
-        "Step 3/3 — Send the <b>minimum deposit amount</b> (e.g., 50):",
+        "Step 4/4 — Send the <b>minimum deposit amount</b> (e.g., 50):",
         parse_mode="HTML",
     )
 
@@ -2096,6 +2273,7 @@ async def pm_new_min_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     name = ctx.user_data.pop("pm_name", None)
     number = ctx.user_data.pop("pm_number", None)
+    sender = ctx.user_data.pop("pm_sms_sender", "")
     ctx.user_data.pop("state", None)
 
     if not name or not number:
@@ -2104,7 +2282,7 @@ async def pm_new_min_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         await sb(supabase.table("payment_methods").insert({
-            "name": name, "number": number, "min_amount": min_amt, "is_active": True,
+            "name": name, "number": number, "sms_sender": sender, "min_amount": min_amt, "is_active": True,
         }))
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {html.escape(str(e))}", reply_markup=admin_menu())
@@ -2150,6 +2328,23 @@ async def pm_edit_number_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         return
     await sb(supabase.table("payment_methods").update({"number": number}).eq("id", pmid))
     await update.message.reply_text(f"✅ Number updated to <code>{html.escape(number)}</code>", parse_mode="HTML")
+    await show_payment_method_detail(update.message, pmid, is_callback=False)
+
+
+async def pm_edit_sms_sender_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pmid = ctx.user_data.pop("pm_edit_id", None)
+    ctx.user_data.pop("state", None)
+    if not pmid:
+        await update.message.reply_text("Session expired.")
+        return
+    sender = update.message.text.strip()
+    if not sender:
+        await update.message.reply_text("❌ Invalid sender. Try again:")
+        ctx.user_data["pm_edit_id"] = pmid
+        ctx.user_data["state"] = "pm_edit_sms_sender"
+        return
+    await sb(supabase.table("payment_methods").update({"sms_sender": sender}).eq("id", pmid))
+    await update.message.reply_text(f"✅ SMS Sender updated to <code>{html.escape(sender)}</code>", parse_mode="HTML")
     await show_payment_method_detail(update.message, pmid, is_callback=False)
 
 
@@ -2594,12 +2789,16 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await pm_new_name_handler(update, ctx)
     if state == "pm_new_number":
         return await pm_new_number_handler(update, ctx)
+    if state == "pm_new_sms_sender":
+        return await pm_new_sms_sender_handler(update, ctx)
     if state == "pm_new_min":
         return await pm_new_min_handler(update, ctx)
     if state == "pm_edit_name":
         return await pm_edit_name_handler(update, ctx)
     if state == "pm_edit_number":
         return await pm_edit_number_handler(update, ctx)
+    if state == "pm_edit_sms_sender":
+        return await pm_edit_sms_sender_handler(update, ctx)
     if state == "pm_edit_min":
         return await pm_edit_min_handler(update, ctx)
 
@@ -2639,6 +2838,9 @@ async def main():
 
     app.add_handler(CallbackQueryHandler(hist_callback, pattern="^hist:"))
     app.add_handler(CallbackQueryHandler(topup_pick_callback, pattern="^tp:pick:"))
+    app.add_handler(CallbackQueryHandler(topup_cancel_callback, pattern="^tup:cancel$"))
+    app.add_handler(CallbackQueryHandler(topup_paid_callback, pattern="^tup:paid$"))
+    app.add_handler(CallbackQueryHandler(tup_manual_review_callback, pattern="^tup:mreview:"))
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
     app.add_handler(CallbackQueryHandler(ord_callback, pattern="^ord:"))
     app.add_handler(CallbackQueryHandler(pm_callback, pattern="^pm:"))
