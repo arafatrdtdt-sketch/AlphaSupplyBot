@@ -26,6 +26,9 @@ SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@support")
 CURRENCY = os.getenv("CURRENCY", "BDT")
 PAYMENT_INFO = os.getenv("PAYMENT_INFO", "bKash: 01XXXXXXXXX (Personal)")
 
+HISTORY_PER_PAGE = 5
+HISTORY_MAX = 50
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("AlphaSupply")
@@ -204,6 +207,28 @@ async def get_usernames_batch(uids):
     except Exception as e:
         log.warning(f"get_usernames_batch error: {e}")
         return {}
+
+
+# -------- Transaction trim helper (max 50 per user) --------
+async def trim_user_transactions(uid):
+    """Keep only the most recent HISTORY_MAX transactions for a user."""
+    try:
+        r = await sb(
+            supabase.table("transactions").select("id")
+            .eq("user_id", uid).order("created_at", desc=True)
+        )
+        rows = r.data or []
+        if len(rows) <= HISTORY_MAX:
+            return
+        to_delete = [row["id"] for row in rows[HISTORY_MAX:]]
+        for i in range(0, len(to_delete), 100):
+            chunk = to_delete[i:i + 100]
+            try:
+                await sb(supabase.table("transactions").delete().in_("id", chunk))
+            except Exception as e:
+                log.warning(f"trim chunk error: {e}")
+    except Exception as e:
+        log.warning(f"trim_user_transactions error: {e}")
 
 
 # -------- Payment Methods helpers --------
@@ -665,6 +690,8 @@ async def do_purchase(q, ctx, product, qty):
                 items = [items]
         new_balance = result.get("new_balance", 0)
         total_cost = result.get("total_cost", 0)
+        # Trim after RPC-inserted transaction
+        asyncio.create_task(trim_user_transactions(uid))
         await send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance)
         return
 
@@ -741,6 +768,8 @@ async def do_purchase(q, ctx, product, qty):
                 }))
             except Exception as e:
                 log.warning(f"pending txn insert failed: {e}")
+            # Trim after manual insert
+            await trim_user_transactions(uid)
 
     await q.answer("⏳ Order processed")
 
@@ -889,26 +918,85 @@ async def show_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+# ============================================================
+# HISTORY (paginated, 5 per page, max 50 stored)
+# ============================================================
+async def build_history_view(uid, page: int = 1):
+    # Trim first (safety net for RPC-inserted transactions)
+    await trim_user_transactions(uid)
+
     r = await sb(
-        supabase.table("transactions").select("*")
-        .eq("user_id", uid).order("created_at", desc=True).limit(20)
+        supabase.table("transactions").select("id")
+        .eq("user_id", uid).order("created_at", desc=True).limit(HISTORY_MAX)
     )
-    txs = r.data or []
-    if not txs:
-        await update.message.reply_text("📜 No transactions yet.")
-        return
-    lines = ["📜 <b>Transaction History</b>\n"]
-    for t in txs:
+    all_ids = [row["id"] for row in (r.data or [])]
+    total = len(all_ids)
+
+    if total == 0:
+        return "📜 <b>Transaction History</b>\n\n<i>No transactions yet.</i>", None
+
+    total_pages = max(1, (total + HISTORY_PER_PAGE - 1) // HISTORY_PER_PAGE)
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * HISTORY_PER_PAGE
+    page_ids = all_ids[start:start + HISTORY_PER_PAGE]
+
+    r2 = await sb(supabase.table("transactions").select("*").in_("id", page_ids))
+    rows = r2.data or []
+    id_to_row = {row["id"]: row for row in rows}
+    ordered = [id_to_row[i] for i in page_ids if i in id_to_row]
+
+    blocks = []
+    for t in ordered:
         sign = "+" if t["amount"] >= 0 else ""
         emoji = {"topup": "💰", "purchase": "🛒", "refund": "↩️", "admin_adjust": "⚙️"}.get(t["type"], "•")
         dt = (t.get("created_at") or "")[:16].replace("T", " ")
-        lines.append(
+        blocks.append(
             f"{emoji} <code>{sign}{t['amount']}</code> {CURRENCY} • {html.escape(t['type'])}\n"
-            f"   <i>{dt}</i> • Bal: {t['balance_after']}"
+            f"<i>{dt}</i> • Bal: {t['balance_after']}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    body = "\n\n".join(blocks)
+
+    header = (
+        f"📜 <b>Transaction History</b>\n\n"
+        f"📊 Total: <b>{total}</b>  •  Page {page}/{total_pages}\n\n"
+    )
+    text = header + body
+
+    nav = []
+    if page > 1:
+        nav.append(btn("⬅️ Prev", callback_data=f"hist:page:{page-1}", style="primary"))
+    if total_pages > 1:
+        nav.append(btn(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+    if page < total_pages:
+        nav.append(btn("Next ➡️", callback_data=f"hist:page:{page+1}", style="primary"))
+    kb = InlineKeyboardMarkup([nav]) if nav else None
+    return text, kb
+
+
+async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text, kb = await build_history_view(uid, 1)
+    if kb:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def hist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        page = int(q.data.split(":")[2])
+    except Exception:
+        page = 1
+    uid = q.from_user.id
+    text, kb = await build_history_view(uid, page)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1423,6 +1511,9 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning(f"refund txn insert failed: {e}")
 
+        # Trim after refund insert
+        await trim_user_transactions(int(o["user_id"]))
+
         try:
             pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
             pname = pr.data[0]["name"] if pr.data else "Product"
@@ -1765,6 +1856,8 @@ async def adm_topup_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
+            # Trim after RPC insert
+            asyncio.create_task(trim_user_transactions(int(u["user_id"])))
         await q.answer("✅ Approved!", show_alert=False)
         text, kb = await build_topups_list_view(1)
         try:
@@ -2544,6 +2637,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(back_cats, pattern="^back_cats$"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
 
+    app.add_handler(CallbackQueryHandler(hist_callback, pattern="^hist:"))
     app.add_handler(CallbackQueryHandler(topup_pick_callback, pattern="^tp:pick:"))
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
     app.add_handler(CallbackQueryHandler(ord_callback, pattern="^ord:"))
