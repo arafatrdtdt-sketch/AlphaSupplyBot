@@ -922,7 +922,6 @@ async def show_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # HISTORY (paginated, 5 per page, max 50 stored)
 # ============================================================
 async def build_history_view(uid, page: int = 1):
-    # Trim first (safety net for RPC-inserted transactions)
     await trim_user_transactions(uid)
 
     r = await sb(
@@ -1202,44 +1201,29 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["is_verifying"] = True
 
     msg = await update.message.reply_text(
-        "⏳ <b>Verifying your payment please wait...</b>",
+        "⏳ <b>Verifying your payment, please wait...</b>",
         parse_mode="HTML"
     )
 
-    # --- Try 1: 5 seconds ---
-    await asyncio.sleep(5)
+    # --- Try 1: 15 seconds ---
+    await asyncio.sleep(15)
     sms_id = await try_verify_payment(txn, amt, sms_sender)
     
-    if sms_id:
-        return await _complete_auto_topup(update, ctx, msg, sms_id, txn, amt, pm_id, pm_name, uid)
-
-    # --- Try 2: 20 more seconds ---
-    await msg.edit_text(
-        "⏳ <b>Payment verify hoyni, we are still trying...</b>\n\n"
-        "Please hold a while we verify the payment.",
-        parse_mode="HTML"
-    )
-    await asyncio.sleep(20)
-    sms_id = await try_verify_payment(txn, amt, sms_sender)
-
     if sms_id:
         return await _complete_auto_topup(update, ctx, msg, sms_id, txn, amt, pm_id, pm_name, uid)
 
     # --- Failed ---
     ctx.user_data["is_verifying"] = False
-    await msg.edit_text(
-        "❌ <b>Payment not found.</b>\n\n"
-        "Please check your SMS and send the correct <b>TrxID</b> again.\n"
-        "Or, if you are sure you paid, request a manual review.",
-        parse_mode="HTML"
-    )
-    
     kb = InlineKeyboardMarkup([
         [btn("📞 Request for Manual Review", callback_data=f"tup:mreview:{txn}", style="danger")],
-        [btn("❌ Cancel", callback_data="tup:cancel", style="primary")]
+        [btn("🔄 Back and Try Again", callback_data="tup:try_again", style="primary")]
     ])
-    await update.message.reply_text(
-        "👇 Choose an option below:",
+    
+    await msg.edit_text(
+        "❌ <b>Payment not found.</b>\n\n"
+        "Please check your SMS and ensure you entered the correct <b>TrxID</b>.\n"
+        "If you are sure you paid, you can request a manual review.",
+        parse_mode="HTML",
         reply_markup=kb
     )
 
@@ -1303,6 +1287,19 @@ async def _complete_auto_topup(update, ctx, msg, sms_id, txn, amt, pm_id, pm_nam
             )
         except Exception:
             pass
+
+
+async def tup_try_again_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["state"] = "topup_txn"
+    try:
+        await q.edit_message_text(
+            "🔄 <b>Please send your Transaction ID (TrxID) again:</b>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 
 async def tup_manual_review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2840,6 +2837,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(topup_pick_callback, pattern="^tp:pick:"))
     app.add_handler(CallbackQueryHandler(topup_cancel_callback, pattern="^tup:cancel$"))
     app.add_handler(CallbackQueryHandler(topup_paid_callback, pattern="^tup:paid$"))
+    app.add_handler(CallbackQueryHandler(tup_try_again_callback, pattern="^tup:try_again$"))
     app.add_handler(CallbackQueryHandler(tup_manual_review_callback, pattern="^tup:mreview:"))
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
     app.add_handler(CallbackQueryHandler(ord_callback, pattern="^ord:"))
