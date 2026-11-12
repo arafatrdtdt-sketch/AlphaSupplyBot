@@ -1111,10 +1111,10 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # New Copy, Cancel, I've Paid buttons
     kb = InlineKeyboardMarkup([
-        [btn(f"{number_str}", copy_text=number_str, style="success")],
+        [btn(f"{number_str}", copy_text=number_str, style="primary")],
         [
             btn("❌ Cancel", callback_data="tup:cancel", style="danger"),
-            btn("✅ I've Paid", callback_data="tup:paid", style="primary")
+            btn("✅ I've Paid", callback_data="tup:paid", style="success")
         ]
     ])
 
