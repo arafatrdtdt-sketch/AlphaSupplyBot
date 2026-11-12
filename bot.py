@@ -430,7 +430,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb.append([btn(
             f"{emoji} {p['name']} — {p['price']} {CURRENCY}",
             callback_data=f"prod:{p['id']}",
-            style="success" if in_stock else "danger",
+            style="success" if in_stock else "primary",
         )])
     kb.append([btn("⬅️ Back", callback_data="back_cats", style="danger")])
     await q.edit_message_text(
