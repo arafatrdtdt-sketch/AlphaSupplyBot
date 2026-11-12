@@ -97,22 +97,85 @@ def parse_proxy_item(content: str):
     return server, port, username, password
 
 
-def format_item_block(idx: int, content: str, total: int = 1) -> str:
-    parsed = parse_proxy_item(content)
-    proxy_label = "🏷 Proxy Details" if total == 1 else f"🏷 Proxy {idx} Details"
-    item_label = "🎁 Item" if total == 1 else f"🎁 Item {idx}"
-    if parsed:
-        server, port, username, password = parsed
+def format_item_block(idx: int, content: str, total: int = 1, category: str = "") -> str:
+    """
+    Auto-format any deliverable based on content + product category.
+
+    Formats:
+      1) Proxy:  server:port:username:password        (port numeric)
+      2) VPN:    username/email:password:key          (3+ parts)
+                 username/email:password              (2 parts, non-mail category)
+      3) Email:  address:password                     (2 parts, mail category)
+      4) Fallback: raw text
+    """
+    content = (content or "").strip()
+    if not content:
+        return ""
+
+    cat_lower = (category or "").lower()
+    is_mail = any(k in cat_lower for k in ["mail", "email", "gmail", "outlook", "hotmail", "yahoo"])
+
+    # ---------- 1) PROXY ----------
+    if not is_mail:
+        parsed = parse_proxy_item(content)
+        if parsed:
+            server, port, username, password = parsed
+            label = "🏷 Proxy Details" if total == 1 else f"🏷 Proxy {idx} Details"
+            return (
+                f"{label}\n\n"
+                f"Server : <code>{html.escape(server)}</code>\n\n"
+                f"Port : <code>{html.escape(port)}</code>\n\n"
+                f"Username : <code>{html.escape(username)}</code>\n\n"
+                f"Password : <code>{html.escape(password)}</code>\n\n"
+                f"⛔️One-line :\n"
+                f"<code>{html.escape(content)}</code>"
+            )
+
+    # ---------- 3) EMAIL ----------
+    if is_mail:
+        parts = content.split(":", 1)
+        if len(parts) == 2:
+            addr = parts[0].strip()
+            pwd = parts[1].strip()
+            label = "📧 Email Details" if total == 1 else f"📧 Email {idx} Details"
+            return (
+                f"{label}\n\n"
+                f"Address : <code>{html.escape(addr)}</code>\n\n"
+                f"Password : <code>{html.escape(pwd)}</code>\n\n"
+                f"⛔️One-line :\n"
+                f"<code>{html.escape(content)}</code>"
+            )
+
+    # ---------- 2) VPN (with or without key) ----------
+    parts = content.split(":")
+    if len(parts) >= 3:
+        username = parts[0].strip()
+        password = parts[1].strip()
+        key = ":".join(parts[2:]).strip()
+        label = "🔐 VPN Details" if total == 1 else f"🔐 VPN {idx} Details"
         return (
-            f"{proxy_label}\n\n"
-            f"Server : <code>{html.escape(server)}</code>\n\n"
-            f"Port : <code>{html.escape(port)}</code>\n\n"
-            f"Username : <code>{html.escape(username)}</code>\n\n"
+            f"{label}\n\n"
+            f"Username / Email : <code>{html.escape(username)}</code>\n\n"
+            f"Password : <code>{html.escape(password)}</code>\n\n"
+            f"Key : <code>{html.escape(key)}</code>\n\n"
+            f"⛔️One-line :\n"
+            f"<code>{html.escape(content)}</code>"
+        )
+    if len(parts) == 2:
+        username = parts[0].strip()
+        password = parts[1].strip()
+        label = "🔐 VPN Details" if total == 1 else f"🔐 VPN {idx} Details"
+        return (
+            f"{label}\n\n"
+            f"Username / Email : <code>{html.escape(username)}</code>\n\n"
             f"Password : <code>{html.escape(password)}</code>\n\n"
             f"⛔️One-line :\n"
             f"<code>{html.escape(content)}</code>"
         )
-    return f"{item_label}\n\n<code>{html.escape(content)}</code>"
+
+    # ---------- 4) FALLBACK ----------
+    label = "🎁 Item" if total == 1 else f"🎁 Item {idx}"
+    return f"{label}\n\n<code>{html.escape(content)}</code>"
 
 
 async def get_user(uid):
@@ -217,7 +280,6 @@ async def refund_balance(user_id, amount):
 
 
 async def complete_pending_order(order_id, items):
-    """Mark pending order as completed WITHOUT deducting balance (already deducted at placement)."""
     r = await sb(supabase.table("orders").select("*").eq("id", order_id).limit(1))
     if not r.data:
         return False, "Order not found"
@@ -330,7 +392,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for p in products:
         in_stock = p["stock"] > 0
-        emoji = "🟢" if in_stock else "🔴"
+        emoji = "" if in_stock else ""
         kb.append([btn(
             f"{emoji} {p['name']} — {p['price']} {CURRENCY}",
             callback_data=f"prod:{p['id']}",
@@ -370,7 +432,7 @@ def build_quantity_view(product, qty):
 
     stock_line = f"📦 Stock: {product['stock']}"
     if product["stock"] <= 0:
-        stock_line += ""
+        stock_line += " (⏳ Pending mode — admin will deliver)"
 
     text = (
         f"🛒 <b>{html.escape(product['name'])}</b>\n\n"
@@ -521,7 +583,8 @@ def build_purchase_header(product, qty, total_cost, new_balance):
 async def send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance):
     header = build_purchase_header(product, qty, total_cost, new_balance)
     total_items = len(items)
-    blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(items, 1)]
+    category = (product.get("category") or "").lower()
+    blocks = [format_item_block(i, c, total=total_items, category=category) for i, c in enumerate(items, 1)]
 
     full_parts = [header]
     for block in blocks:
@@ -693,6 +756,8 @@ async def do_purchase(q, ctx, product, qty):
 
     await q.answer("⏳ Order processed")
 
+    category = (product.get("category") or "").lower()
+
     if deliver_qty > 0 and pending_qty > 0:
         header = (
             f"⚠️ <b>Partial Delivery</b>\n"
@@ -706,7 +771,7 @@ async def do_purchase(q, ctx, product, qty):
             f"💳 Your Balance: {fmt_price(final_balance)} {CURRENCY}\n"
         )
         total_items = len(delivered_items)
-        blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(delivered_items, 1)]
+        blocks = [format_item_block(i, c, total=total_items, category=category) for i, c in enumerate(delivered_items, 1)]
         body = "\n\n".join(["━━━━━━━━━━━━━━━━━━━━━━\n" + b for b in blocks])
         tail = (
             f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1434,12 +1499,19 @@ async def adm_fulfill_order_handler(update: Update, ctx: ContextTypes.DEFAULT_TY
     o = result["order"]
     new_balance = result["new_balance"]
     items = result["items"]
-    total_items = len(items)
-    blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(items, 1)]
-    body = "\n\n".join(["━━━━━━━━━━━━━━━━━━━━━━\n" + b for b in blocks])
 
-    pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
-    pname = pr.data[0]["name"] if pr.data else "Product"
+    # Fetch product category to pick format
+    pr = await sb(supabase.table("products").select("name,category").eq("id", o["product_id"]).limit(1))
+    if pr.data:
+        pname = pr.data[0].get("name", "Product")
+        pcat = (pr.data[0].get("category") or "").lower()
+    else:
+        pname = "Product"
+        pcat = ""
+
+    total_items = len(items)
+    blocks = [format_item_block(i, c, total=total_items, category=pcat) for i, c in enumerate(items, 1)]
+    body = "\n\n".join(["━━━━━━━━━━━━━━━━━━━━━━\n" + b for b in blocks])
 
     header = (
         f"✅ <b>Pending Order Completed</b>\n"
@@ -2270,7 +2342,11 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["stock_pid"] = pid
         ctx.user_data["state"] = "adm_stock_items"
         await q.edit_message_text(
-            "📦 <b>Add Stock</b>\n\nSend items, <b>one per line</b>.\nEach line becomes one deliverable.",
+            "📦 <b>Add Stock</b>\n\nSend items, <b>one per line</b>.\nEach line becomes one deliverable.\n\n"
+            "Format examples:\n"
+            "• Proxy: <code>server:port:user:pass</code>\n"
+            "• VPN: <code>user:pass:key</code> or <code>user:pass</code>\n"
+            "• Email: <code>address:password</code>",
             parse_mode="HTML",
         )
 
