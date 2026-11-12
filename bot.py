@@ -195,7 +195,30 @@ async def create_pending_order(user_id, product_id, qty, unit_price):
     return r.data[0] if r.data else None
 
 
+async def deduct_balance_atomic(user_id, amount):
+    """Deduct balance and return new balance. Returns (success, new_balance)."""
+    user = await get_user(user_id)
+    if not user:
+        return False, 0.0
+    balance = float(user["balance"])
+    if balance < amount:
+        return False, balance
+    new_balance = balance - amount
+    await sb(supabase.table("users").update({"balance": new_balance}).eq("id", user_id))
+    return True, new_balance
+
+
+async def refund_balance(user_id, amount):
+    user = await get_user(user_id)
+    if not user:
+        return 0.0
+    new_balance = float(user["balance"]) + amount
+    await sb(supabase.table("users").update({"balance": new_balance}).eq("id", user_id))
+    return new_balance
+
+
 async def complete_pending_order(order_id, items):
+    """Mark pending order as completed WITHOUT deducting balance (already deducted at placement)."""
     r = await sb(supabase.table("orders").select("*").eq("id", order_id).limit(1))
     if not r.data:
         return False, "Order not found"
@@ -207,46 +230,16 @@ async def complete_pending_order(order_id, items):
     if not user:
         return False, "User not found"
 
-    total_cost = float(o["total_price"])
-    balance = float(user["balance"])
-    if balance < total_cost:
-        return False, (
-            f"User balance insufficient.\n"
-            f"Has: {fmt_price(balance)} {CURRENCY}\n"
-            f"Needs: {fmt_price(total_cost)} {CURRENCY}"
-        )
-
-    new_balance = balance - total_cost
-
-    await sb(supabase.table("users").update({"balance": new_balance}).eq("id", o["user_id"]))
+    # Balance was already deducted at order placement - do NOT deduct again
+    current_balance = float(user["balance"])
 
     items_text = "\n".join(items)
-    update_payload = {
+    await sb(supabase.table("orders").update({
         "status": "completed",
         "delivered_items": items_text,
-    }
-    try:
-        await sb(supabase.table("orders").update(update_payload).eq("id", order_id))
-    except Exception:
-        # completed_at column might not exist — retry minimal
-        await sb(supabase.table("orders").update({
-            "status": "completed",
-            "delivered_items": items_text,
-        }).eq("id", order_id))
+    }).eq("id", order_id))
 
-    try:
-        await sb(supabase.table("transactions").insert({
-            "user_id": o["user_id"],
-            "type": "purchase",
-            "amount": -total_cost,
-            "balance_after": new_balance,
-            "reference": f"pending_order_{order_id}",
-            "note": "Pending order fulfilled by admin",
-        }))
-    except Exception as e:
-        log.warning(f"Transaction insert failed: {e}")
-
-    return True, {"order": o, "items": items, "new_balance": new_balance}
+    return True, {"order": o, "items": items, "new_balance": current_balance}
 
 
 # -------- Menu labels --------
@@ -374,7 +367,7 @@ def build_quantity_view(product, qty):
     if product["stock"] <= 0:
         qty = max(1, qty)
     else:
-        qty = max(1, min(qty, max_q))
+        qty = max(1, min(qty, max_q)) if qty <= max_q else qty
     total = float(product["price"]) * qty
 
     stock_line = f"📦 Stock: {product['stock']}"
@@ -443,12 +436,10 @@ async def qty_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "inc":
         qty = int(parts[3]) + 1
-        # No stock limit for pending mode — allow up to 99
         if qty > 99:
             await q.answer("Max 99 per order.", show_alert=True)
             return
         if p["stock"] > 0 and qty > p["stock"]:
-            # Going past stock is allowed now (pending mode)
             await q.answer(f"Note: {p['stock']} in stock, rest will be pending.", show_alert=False)
         else:
             await q.answer()
@@ -512,7 +503,7 @@ async def qty_manual_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# PURCHASE EXECUTION (with pending fallback)
+# PURCHASE EXECUTION (balance deducted UPFRONT for pending)
 # ============================================================
 def build_purchase_header(product, qty, total_cost, new_balance):
     header = (
@@ -606,7 +597,7 @@ async def do_purchase(q, ctx, product, qty):
             log.exception("purchase failed")
             msg = str(e).lower()
             if "insufficient_balance" in msg:
-                await q.answer(f"❌ Insufficient balance.", show_alert=True)
+                await q.answer("❌ Insufficient balance.", show_alert=True)
                 await render_quantity_view(q, product, qty)
             elif "out_of_stock" in msg:
                 await q.answer("❌ Not enough stock. Try smaller qty.", show_alert=True)
@@ -656,16 +647,58 @@ async def do_purchase(q, ctx, product, qty):
             delivered_balance = float(result.get("new_balance", balance))
         except Exception as e:
             log.exception("partial delivery failed")
+            # If RPC failed, fall back to full-pending path
             deliver_qty = 0
             pending_qty = qty
             delivered_items = []
+            delivered_cost = 0.0
+            delivered_balance = balance
 
+    # Deduct pending amount upfront
+    pending_cost = pending_qty * unit_price
     pending_order = None
-    if pending_qty > 0:
+    final_balance = delivered_balance
+
+    if pending_qty > 0 and pending_cost > 0:
+        ok, final_balance = await deduct_balance_atomic(uid, pending_cost)
+        if not ok:
+            # Something wrong: balance check earlier passed but not now?
+            # Rollback full-delivered portion if any
+            log.error(f"Pending deduction failed for user {uid}, need {pending_cost}")
+            if deliver_qty > 0:
+                # Refund delivered portion so user isn't charged incorrectly
+                await refund_balance(uid, delivered_cost)
+            await q.answer(
+                "❌ Insufficient balance to place order. Please try again.",
+                show_alert=True,
+            )
+            await render_quantity_view(q, product, qty)
+            return
+
         try:
             pending_order = await create_pending_order(uid, product["id"], pending_qty, unit_price)
         except Exception as e:
             log.error(f"Pending order create error: {e}")
+            # Refund pending cost since order wasn't created
+            await refund_balance(uid, pending_cost)
+            final_balance = final_balance + pending_cost
+            await q.answer("❌ Order failed. Please try again.", show_alert=True)
+            await render_quantity_view(q, product, qty)
+            return
+
+        # Insert transaction record for the pending portion (balance already deducted)
+        if pending_order:
+            try:
+                await sb(supabase.table("transactions").insert({
+                    "user_id": uid,
+                    "type": "purchase",
+                    "amount": -pending_cost,
+                    "balance_after": final_balance,
+                    "reference": f"pending_{pending_order['id']}",
+                    "note": f"Pending order placed ({pending_qty} qty)",
+                }))
+            except Exception as e:
+                log.warning(f"pending txn insert failed: {e}")
 
     await q.answer("⏳ Order processed")
 
@@ -678,9 +711,8 @@ async def do_purchase(q, ctx, product, qty):
             f"✅ Delivered: <b>{deliver_qty}</b>\n"
             f"⏳ Pending: <b>{pending_qty}</b>\n\n"
             f"💵 Delivered Cost: {fmt_price(delivered_cost)} {CURRENCY}\n"
-            f"💳 Your Balance: {fmt_price(delivered_balance)} {CURRENCY}\n"
-            f"💵 Pending Amount: {fmt_price(pending_qty * unit_price)} {CURRENCY}\n"
-            f"   (charged when admin delivers)\n"
+            f"💵 Pending Cost: {fmt_price(pending_cost)} {CURRENCY} (already charged)\n"
+            f"💳 Your Balance: {fmt_price(final_balance)} {CURRENCY}\n"
         )
         total_items = len(delivered_items)
         blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(delivered_items, 1)]
@@ -688,7 +720,8 @@ async def do_purchase(q, ctx, product, qty):
         tail = (
             f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>{pending_qty} item(s) pending</b>\n"
-            f"Admin has been notified. You'll receive them shortly."
+            f"Admin has been notified. You'll receive them shortly.\n"
+            f"💡 If admin cancels, the pending amount will be <b>refunded</b> to your balance."
         )
         full = header + "\n" + body + tail
         if len(full) <= 4000:
@@ -734,11 +767,11 @@ async def do_purchase(q, ctx, product, qty):
                 f"⏳ <b>Order Pending</b>\n\n"
                 f"📦 Product: <b>{html.escape(product['name'])}</b>\n"
                 f"🔢 Quantity: <b>{pending_qty}</b>\n"
-                f"💵 Amount: <b>{fmt_price(pending_qty * unit_price)} {CURRENCY}</b>\n\n"
+                f"💵 Amount: <b>{fmt_price(pending_cost)} {CURRENCY}</b>\n\n"
                 f"❌ Out of stock right now.\n"
                 f"Your order has been forwarded to admin.\n\n"
-                f"💡 You will be charged <b>only when</b> admin delivers.\n"
-                f"Admin will complete it shortly.",
+                f"💡 <b>{fmt_price(pending_cost)} {CURRENCY}</b> already charged.\n"
+                f"If admin <b>cancels</b>, full amount will be <b>refunded</b>.",
                 parse_mode="HTML",
             )
         except Exception:
@@ -754,7 +787,7 @@ async def do_purchase(q, ctx, product, qty):
                     f"👤 User: <code>{uid}</code>\n"
                     f"📦 Product: <b>{html.escape(product['name'])}</b>\n"
                     f"🔢 Quantity: <b>{pending_qty}</b>\n"
-                    f"💵 Amount: <b>{fmt_price(pending_qty * unit_price)} {CURRENCY}</b>\n\n"
+                    f"💵 Amount: <b>{fmt_price(pending_cost)} {CURRENCY}</b> (already charged)\n\n"
                     f"Go to ⚙️ Admin Panel → ⏳ Pending Orders",
                     parse_mode="HTML",
                 )
@@ -832,10 +865,6 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ============================================================
 # USER TOPUP FLOW
-#   1) Ask amount
-#   2) Show eligible payment methods (min_amount <= amt)
-#   3) Show exact amount + number (copy button)
-#   4) Ask TrxID
 # ============================================================
 async def start_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in ("topup_pmid", "topup_pm_name", "topup_min", "topup_amount"):
@@ -1103,7 +1132,7 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
 
 
 # ============================================================
-# ADMIN — PENDING ORDERS (NEW)
+# ADMIN — PENDING ORDERS
 # ============================================================
 PENDING_ORDERS_PER_PAGE = 10
 
@@ -1198,13 +1227,13 @@ async def build_pending_order_detail(order_id: int):
         f"💰 Balance: <code>{balance} {CURRENCY}</code>\n"
         f"📦 Product: <b>{html.escape(pname)}</b>\n"
         f"🔢 Quantity: <b>{o['quantity']}</b>\n"
-        f"💵 Amount due: <b>{fmt_price(o['total_price'])} {CURRENCY}</b>\n"
+        f"💵 Amount: <b>{fmt_price(o['total_price'])} {CURRENCY}</b> (already charged)\n"
         f"📅 Created: {(o.get('created_at') or '')[:16].replace('T', ' ')}\n\n"
         f"Provide items to complete this order:"
     )
     kb = [
         [btn("✅ Fulfill Order", callback_data=f"ord:fulfill:{order_id}", style="success")],
-        [btn("❌ Cancel Order", callback_data=f"ord:cancel:{order_id}", style="danger")],
+        [btn("❌ Cancel & Refund", callback_data=f"ord:cancel:{order_id}", style="danger")],
         [btn("⬅️ Back to List", callback_data="ord:list:1", style="primary")],
     ]
     return text, InlineKeyboardMarkup(kb)
@@ -1258,6 +1287,7 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Send <b>{o['quantity']}</b> item(s), one per line.\n\n"
                 f"Each line = one deliverable item.\n"
                 f"Count must match exactly.\n\n"
+                f"💡 No balance will be deducted — already charged at order time.\n\n"
                 f"Type /cancel to abort.",
                 parse_mode="HTML",
             )
@@ -1267,15 +1297,21 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("ord:cancel:"):
         oid = int(data.split(":")[2])
         await q.answer()
+        r = await sb(supabase.table("orders").select("*").eq("id", oid).limit(1))
+        if not r.data:
+            await q.answer("Not found.", show_alert=True)
+            return
+        o = r.data[0]
         kb = InlineKeyboardMarkup([[
-            btn("✅ Confirm Cancel", callback_data=f"ord:rejcancel:{oid}", style="danger"),
+            btn("✅ Confirm Cancel & Refund", callback_data=f"ord:rejcancel:{oid}", style="danger"),
             btn("❌ Keep", callback_data=f"ord:view:{oid}", style="primary"),
         ]])
         try:
             await q.edit_message_text(
                 f"⚠️ <b>Cancel Pending Order #{oid}?</b>\n\n"
-                f"User will <b>NOT</b> be charged.\n"
-                f"The order will be marked cancelled.",
+                f"💰 Refund amount: <b>{fmt_price(o['total_price'])} {CURRENCY}</b>\n\n"
+                f"The refund will be added back to the user's balance.\n"
+                f"This cannot be undone.",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -1293,12 +1329,31 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if o["status"] != "pending":
             await q.answer("Already processed.", show_alert=True)
             return
+
         try:
             await sb(supabase.table("orders").update({"status": "cancelled"}).eq("id", oid))
         except Exception as e:
             await q.edit_message_text(f"❌ Error: {html.escape(str(e))}")
             return
 
+        # Refund full amount back to user
+        refund_amount = float(o["total_price"])
+        new_balance = await refund_balance(int(o["user_id"]), refund_amount)
+
+        # Create refund transaction record
+        try:
+            await sb(supabase.table("transactions").insert({
+                "user_id": o["user_id"],
+                "type": "refund",
+                "amount": refund_amount,
+                "balance_after": new_balance,
+                "reference": f"cancel_order_{oid}",
+                "note": f"Pending order #{oid} cancelled - refund",
+            }))
+        except Exception as e:
+            log.warning(f"refund txn insert failed: {e}")
+
+        # Notify user
         try:
             pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
             pname = pr.data[0]["name"] if pr.data else "Product"
@@ -1307,15 +1362,15 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"❌ <b>Pending Order Cancelled</b>\n\n"
                 f"📦 Product: <b>{html.escape(pname)}</b>\n"
                 f"🔢 Quantity: {o['quantity']}\n"
-                f"💵 Amount: {fmt_price(o['total_price'])} {CURRENCY}\n\n"
-                f"You were <b>NOT</b> charged for this order.\n"
-                f"Please contact support if you need help.",
+                f"💰 Refund: <b>{fmt_price(refund_amount)} {CURRENCY}</b>\n"
+                f"💳 New Balance: <b>{fmt_price(new_balance)} {CURRENCY}</b>\n\n"
+                f"Amount has been refunded to your wallet.",
                 parse_mode="HTML",
             )
         except Exception:
             pass
 
-        await q.answer("Cancelled.", show_alert=False)
+        await q.answer(f"Refunded {fmt_price(refund_amount)} {CURRENCY}.", show_alert=True)
         text, kb = await build_pending_orders_list(1)
         try:
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1379,7 +1434,7 @@ async def adm_fulfill_order_handler(update: Update, ctx: ContextTypes.DEFAULT_TY
         f"📦 Order: <code>#{o['id']}</code>\n"
         f"🛍 Product: <b>{html.escape(pname)}</b>\n"
         f"🔢 Quantity: <b>{o['quantity']}</b>\n"
-        f"💵 Charged: {fmt_price(o['total_price'])} {CURRENCY}\n"
+        f"💵 Charged: {fmt_price(o['total_price'])} {CURRENCY} (already paid)\n"
         f"💳 Your Balance: {fmt_price(new_balance)} {CURRENCY}\n"
     )
     full = header + "\n" + body
