@@ -370,7 +370,7 @@ def build_quantity_view(product, qty):
 
     stock_line = f"📦 Stock: {product['stock']}"
     if product["stock"] <= 0:
-        stock_line += " (⏳ Pending mode — admin will deliver)"
+        stock_line += ""
 
     text = (
         f"🛒 <b>{html.escape(product['name'])}</b>\n\n"
