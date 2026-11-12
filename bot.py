@@ -389,7 +389,7 @@ async def show_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     kb = [[btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary")] for c in cats]
     await update.message.reply_text(
-        "🛒 <b>Select a category:</b>",
+        "🛒 <b>Select a category you want to buy:</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -1057,7 +1057,7 @@ async def topup_amount_first_handler(update: Update, ctx: ContextTypes.DEFAULT_T
     kb = []
     for m in eligible:
         kb.append([btn(
-            f"🏦 {m['name']}",
+            f"{m['name']}",
             callback_data=f"tp:pick:{m['id']}",
             style="primary",
         )])
@@ -1111,7 +1111,7 @@ async def topup_pick_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # New Copy, Cancel, I've Paid buttons
     kb = InlineKeyboardMarkup([
-        [btn(f"📋 {number_str}", copy_text=number_str, style="success")],
+        [btn(f"{number_str}", copy_text=number_str, style="success")],
         [
             btn("❌ Cancel", callback_data="tup:cancel", style="danger"),
             btn("✅ I've Paid", callback_data="tup:paid", style="primary")
@@ -1214,9 +1214,14 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- Failed ---
     ctx.user_data["is_verifying"] = False
+    
+    # New Button Layout: Request Manual Review on top, Cancel and Try Again side-by-side
     kb = InlineKeyboardMarkup([
         [btn("📞 Request for Manual Review", callback_data=f"tup:mreview:{txn}", style="danger")],
-        [btn("🔄 Back and Try Again", callback_data="tup:try_again", style="primary")]
+        [
+            btn("❌ Cancel", callback_data="tup:cancel", style="danger"),
+            btn("🔄 Try Again", callback_data="tup:try_again", style="primary")
+        ]
     ])
     
     await msg.edit_text(
@@ -1372,7 +1377,7 @@ async def build_products_view():
 
     kb = []
     for p in products:
-        emoji = "🟢" if p.get("is_active") else "🔴"
+        emoji = "" if p.get("is_active") else ""
         stock = p.get("stock", 0)
         kb.append([btn(
             f"{emoji} {p['name']} • {p['price']} {CURRENCY} • stock: {stock}",
