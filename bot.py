@@ -387,12 +387,31 @@ async def show_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not cats:
         await update.message.reply_text("❌ No products available right now.")
         return
-    kb = [[btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary")] for c in cats]
+    # 2 per line
+    kb = []
+    row = []
+    for c in cats:
+        row.append(btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([btn("❌ Cancel", callback_data="cancel_browse", style="danger")])
     await update.message.reply_text(
         "🛒 <b>Select a category you want to buy:</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb),
     )
+
+
+async def cancel_browse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.edit_message_text("❌ Browse cancelled.")
+    except Exception:
+        pass
 
 
 async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -426,7 +445,17 @@ async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     r = await sb(supabase.table("products").select("category").eq("is_active", True))
     cats = sorted({row["category"] for row in (r.data or [])})
-    kb = [[btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary")] for c in cats]
+    # 2 per line
+    kb = []
+    row = []
+    for c in cats:
+        row.append(btn(f"📦 {c.title()}", callback_data=f"cat:{c}", style="primary"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([btn("❌ Cancel", callback_data="cancel_browse", style="danger")])
     await q.edit_message_text(
         "🛒 <b>Select a category:</b>",
         parse_mode="HTML",
@@ -1054,13 +1083,21 @@ async def topup_amount_first_handler(update: Update, ctx: ContextTypes.DEFAULT_T
     ctx.user_data["topup_amount"] = amt
     ctx.user_data.pop("state", None)
 
+    # 2 per line + cancel button
     kb = []
+    row = []
     for m in eligible:
-        kb.append([btn(
+        row.append(btn(
             f"{m['name']}",
             callback_data=f"tp:pick:{m['id']}",
             style="primary",
-        )])
+        ))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([btn("❌ Cancel", callback_data="tup:cancel", style="danger")])
 
     await update.message.reply_text(
         f"💰 <b>Add Balance</b>\n\n"
@@ -1361,30 +1398,75 @@ async def tup_manual_review_callback(update: Update, ctx: ContextTypes.DEFAULT_T
 
 
 # ============================================================
-# ADMIN — PRODUCT MANAGEMENT
+# ADMIN — PRODUCT MANAGEMENT (CATEGORY-WISE UI)
 # ============================================================
 async def build_products_view():
-    r = await sb(supabase.table("products").select("*").order("id"))
+    """Show categories view (Admin)."""
+    r = await sb(supabase.table("products").select("category").order("category"))
+    rows = r.data or []
+    if not rows:
+        kb = [
+            [btn("➕ Add New Product", callback_data="adm:newprod", style="success")],
+            [btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")],
+        ]
+        return "📦 <b>Product Categories</b>\n\nNo products yet.\n\nAdd your first product:", InlineKeyboardMarkup(kb)
+
+    counts = {}
+    for row in rows:
+        cat = row.get("category") or "uncategorized"
+        counts[cat] = counts.get(cat, 0) + 1
+
+    kb = []
+    for cat in sorted(counts.keys()):
+        kb.append([btn(
+            f"📁 {cat.title()} ({counts[cat]})",
+            callback_data=f"adm:prodcat:{cat}",
+            style="primary",
+        )])
+    kb.append([btn("➕ Add New Product", callback_data="adm:newprod", style="success")])
+    kb.append([btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")])
+    return (
+        f"📦 <b>Product Categories</b> ({len(counts)})\n\n"
+        f"Select a category to view its products:",
+        InlineKeyboardMarkup(kb),
+    )
+
+
+async def build_category_products_view(category: str):
+    """Show products within a specific category (Admin)."""
+    if not category:
+        return await build_products_view()
+
+    r = await sb(supabase.table("products").select("*").eq("category", category).order("id"))
     products = r.data or []
+
     if not products:
         kb = [
             [btn("➕ Add New Product", callback_data="adm:newprod", style="success")],
-            [btn("⬅️ Back", callback_data="adm:back", style="danger")],
+            [btn("⬅️ Back to Categories", callback_data="adm:prods", style="danger")],
         ]
-        return "📦 <b>No products yet.</b>\n\nAdd your first product:", InlineKeyboardMarkup(kb)
+        return (
+            f"📁 <b>{html.escape(category.title())}</b>\n\n"
+            f"No products in this category.",
+            InlineKeyboardMarkup(kb),
+        )
 
     kb = []
     for p in products:
-        emoji = "" if p.get("is_active") else ""
+        emoji = "🟢" if p.get("is_active") else "🔴"
         stock = p.get("stock", 0)
         kb.append([btn(
             f"{emoji} {p['name']} • {p['price']} {CURRENCY} • stock: {stock}",
             callback_data=f"adm:prod:{p['id']}",
-            style="primary",
+            style="primary" if p.get("is_active") else "danger",
         )])
     kb.append([btn("➕ Add New Product", callback_data="adm:newprod", style="success")])
-    kb.append([btn("⬅️ Back", callback_data="adm:back", style="danger")])
-    return f"📦 <b>All Products</b> ({len(products)})\n\nClick a product to manage:", InlineKeyboardMarkup(kb)
+    kb.append([btn("⬅️ Back to Categories", callback_data="adm:prods", style="danger")])
+    return (
+        f"📁 <b>{html.escape(category.title())}</b> ({len(products)})\n\n"
+        f"Click a product to manage:",
+        InlineKeyboardMarkup(kb),
+    )
 
 
 async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
@@ -1422,19 +1504,23 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
         f"Status: {'✅ Active' if p.get('is_active') else '❌ Inactive'}"
     )
 
+    # Back to category
+    cat = p.get("category") or ""
+    back_cb = f"adm:prodcat:{cat}" if cat else "adm:prods"
+
     if p.get("is_active"):
         kb = [
             [btn("➕ Add Stock", callback_data=f"adm:stock:{pid}", style="success"),
              btn("🗑️ Clear Unsold", callback_data=f"adm:clrstock:{pid}", style="danger")],
             [btn("✏️ Edit Price", callback_data=f"adm:eprice:{pid}", style="primary"),
              btn("🗑️ Delete Product", callback_data=f"adm:delconf:{pid}", style="danger")],
-            [btn("⬅️ Back to Products", callback_data="adm:prods", style="primary")],
+            [btn(f"⬅️ Back to {cat.title() if cat else 'Categories'}", callback_data=back_cb, style="primary")],
         ]
     else:
         kb = [
             [btn("✅ Reactivate Product", callback_data=f"adm:reactivate:{pid}", style="success")],
             [btn("🗑️ Delete Permanently", callback_data=f"adm:delconf:{pid}", style="danger")],
-            [btn("⬅️ Back to Products", callback_data="adm:prods", style="primary")],
+            [btn(f"⬅️ Back to {cat.title() if cat else 'Categories'}", callback_data=back_cb, style="primary")],
         ]
     markup = InlineKeyboardMarkup(kb)
     if is_callback:
@@ -2465,7 +2551,8 @@ async def adm_addprod_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Product added: <b>{html.escape(data['name'])}</b>",
         parse_mode="HTML",
     )
-    text, kbd = await build_products_view()
+    # Show the category view of newly added product
+    text, kbd = await build_category_products_view(data["category"])
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kbd)
 
 
@@ -2589,6 +2676,12 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kbd = await build_products_view()
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=kbd)
 
+    elif data.startswith("adm:prodcat:"):
+        await q.answer()
+        cat = data.split(":", 2)[2]
+        text, kbd = await build_category_products_view(cat)
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kbd)
+
     elif data == "adm:back":
         await q.answer()
         await q.message.reply_text(
@@ -2689,6 +2782,16 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("adm:delyes:"):
         await q.answer("Processing...")
         pid = int(data.split(":")[2])
+
+        # Get category before deletion
+        cat = None
+        try:
+            pr = await sb(supabase.table("products").select("category").eq("id", pid).limit(1))
+            if pr.data:
+                cat = pr.data[0].get("category")
+        except Exception:
+            pass
+
         try:
             order_check = await sb(supabase.table("orders").select("id", count="exact").eq("product_id", pid))
             has_orders = (order_check.count or 0) > 0
@@ -2703,7 +2806,11 @@ async def adm_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await q.edit_message_text(f"❌ Error: {html.escape(str(e))}")
             return
-        text, kbd = await build_products_view()
+
+        if cat:
+            text, kbd = await build_category_products_view(cat)
+        else:
+            text, kbd = await build_products_view()
         try:
             await q.edit_message_text(f"{note}\n\n{text}", parse_mode="HTML", reply_markup=kbd)
         except Exception:
@@ -2834,6 +2941,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(prod_callback, pattern="^prod:"))
     app.add_handler(CallbackQueryHandler(qty_callback, pattern="^qty:"))
     app.add_handler(CallbackQueryHandler(back_cats, pattern="^back_cats$"))
+    app.add_handler(CallbackQueryHandler(cancel_browse, pattern="^cancel_browse$"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
 
     app.add_handler(CallbackQueryHandler(hist_callback, pattern="^hist:"))
