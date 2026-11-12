@@ -181,6 +181,74 @@ async def get_payment_method(pmid):
         return None
 
 
+# -------- Pending orders helpers --------
+async def create_pending_order(user_id, product_id, qty, unit_price):
+    total = float(unit_price) * qty
+    r = await sb(supabase.table("orders").insert({
+        "user_id": user_id,
+        "product_id": product_id,
+        "quantity": qty,
+        "total_price": total,
+        "status": "pending",
+        "delivered_items": "",
+    }))
+    return r.data[0] if r.data else None
+
+
+async def complete_pending_order(order_id, items):
+    r = await sb(supabase.table("orders").select("*").eq("id", order_id).limit(1))
+    if not r.data:
+        return False, "Order not found"
+    o = r.data[0]
+    if o["status"] != "pending":
+        return False, f"Order is already {o['status']}"
+
+    user = await get_user(int(o["user_id"]))
+    if not user:
+        return False, "User not found"
+
+    total_cost = float(o["total_price"])
+    balance = float(user["balance"])
+    if balance < total_cost:
+        return False, (
+            f"User balance insufficient.\n"
+            f"Has: {fmt_price(balance)} {CURRENCY}\n"
+            f"Needs: {fmt_price(total_cost)} {CURRENCY}"
+        )
+
+    new_balance = balance - total_cost
+
+    await sb(supabase.table("users").update({"balance": new_balance}).eq("id", o["user_id"]))
+
+    items_text = "\n".join(items)
+    update_payload = {
+        "status": "completed",
+        "delivered_items": items_text,
+    }
+    try:
+        await sb(supabase.table("orders").update(update_payload).eq("id", order_id))
+    except Exception:
+        # completed_at column might not exist — retry minimal
+        await sb(supabase.table("orders").update({
+            "status": "completed",
+            "delivered_items": items_text,
+        }).eq("id", order_id))
+
+    try:
+        await sb(supabase.table("transactions").insert({
+            "user_id": o["user_id"],
+            "type": "purchase",
+            "amount": -total_cost,
+            "balance_after": new_balance,
+            "reference": f"pending_order_{order_id}",
+            "note": "Pending order fulfilled by admin",
+        }))
+    except Exception as e:
+        log.warning(f"Transaction insert failed: {e}")
+
+    return True, {"order": o, "items": items, "new_balance": new_balance}
+
+
 # -------- Menu labels --------
 MENU_BUY = "🛒 Buy Items"
 MENU_BALANCE = "💰 Add Balance"
@@ -193,10 +261,11 @@ MENU_BUTTONS = {MENU_BUY, MENU_BALANCE, MENU_PROFILE, MENU_HISTORY, MENU_SUPPORT
 ADM_PRODUCTS = "📦 Product"
 ADM_BROADCAST = "📢 Broadcast"
 ADM_TOPUPS = "💳 Pending Topups"
+ADM_ORDERS = "⏳ Pending Orders"
 ADM_STATS = "📊 Stats"
 ADM_PAYMENTS = "🏦 Payment Methods"
 ADM_BACK = "⬅️ Back to Main Menu"
-ADMIN_BUTTONS = {ADM_PRODUCTS, ADM_BROADCAST, ADM_TOPUPS, ADM_STATS, ADM_PAYMENTS, ADM_BACK}
+ADMIN_BUTTONS = {ADM_PRODUCTS, ADM_BROADCAST, ADM_TOPUPS, ADM_ORDERS, ADM_STATS, ADM_PAYMENTS, ADM_BACK}
 
 
 def main_menu(admin: bool = False):
@@ -213,8 +282,8 @@ def main_menu(admin: bool = False):
 def admin_menu():
     kb = [
         [{"text": ADM_PRODUCTS, "style": "success"}, {"text": ADM_BROADCAST, "style": "primary"}],
-        [{"text": ADM_TOPUPS, "style": "primary"}, {"text": ADM_STATS, "style": "primary"}],
-        [{"text": ADM_PAYMENTS, "style": "success"}],
+        [{"text": ADM_TOPUPS, "style": "primary"}, {"text": ADM_ORDERS, "style": "primary"}],
+        [{"text": ADM_STATS, "style": "primary"}, {"text": ADM_PAYMENTS, "style": "success"}],
         [{"text": ADM_BACK, "style": "danger"}],
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -303,15 +372,19 @@ async def back_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_quantity_view(product, qty):
     max_q = max(1, int(product["stock"]))
     if product["stock"] <= 0:
-        qty = 1
+        qty = max(1, qty)
     else:
         qty = max(1, min(qty, max_q))
     total = float(product["price"]) * qty
 
+    stock_line = f"📦 Stock: {product['stock']}"
+    if product["stock"] <= 0:
+        stock_line += " (⏳ Pending mode — admin will deliver)"
+
     text = (
         f"🛒 <b>{html.escape(product['name'])}</b>\n\n"
         f"💰 Price: {fmt_price(product['price'])} {CURRENCY}\n"
-        f"📦 Stock: {product['stock']}\n"
+        f"{stock_line}\n"
         f"📝 {html.escape(product.get('description') or '—')}\n\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🔢 Quantity: <b>{qty}</b>\n"
@@ -319,22 +392,16 @@ def build_quantity_view(product, qty):
         f"━━━━━━━━━━━━━━━"
     )
 
-    if product["stock"] <= 0:
-        kb = [
-            [btn("❌ Out of Stock", callback_data="noop", style="danger")],
-            [btn("⬅️ Back", callback_data=f"cat:{product['category']}", style="danger")],
-        ]
-    else:
-        kb = [
-            [
-                btn("-", callback_data=f"qty:dec:{product['id']}:{qty}", style="danger"),
-                btn(f"🛒 {qty}", callback_data=f"qty:info:{product['id']}", style="success"),
-                btn("+", callback_data=f"qty:inc:{product['id']}:{qty}", style="primary"),
-            ],
-            [btn("✏️ Enter Quantity", callback_data=f"qty:manual:{product['id']}", style="primary")],
-            [btn("✅ Confirm & Buy", callback_data=f"qty:buy:{product['id']}:{qty}", style="success")],
-            [btn("⬅️ Back", callback_data=f"cat:{product['category']}", style="danger")],
-        ]
+    kb = [
+        [
+            btn("-", callback_data=f"qty:dec:{product['id']}:{qty}", style="danger"),
+            btn(f"🛒 {qty}", callback_data=f"qty:info:{product['id']}", style="success"),
+            btn("+", callback_data=f"qty:inc:{product['id']}:{qty}", style="primary"),
+        ],
+        [btn("✏️ Enter Quantity", callback_data=f"qty:manual:{product['id']}", style="primary")],
+        [btn("✅ Confirm & Buy", callback_data=f"qty:buy:{product['id']}:{qty}", style="success")],
+        [btn("⬅️ Back", callback_data=f"cat:{product['category']}", style="danger")],
+    ]
     return text, InlineKeyboardMarkup(kb)
 
 
@@ -376,10 +443,15 @@ async def qty_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "inc":
         qty = int(parts[3]) + 1
-        if qty > p["stock"]:
-            await q.answer(f"Only {p['stock']} in stock!", show_alert=True)
+        # No stock limit for pending mode — allow up to 99
+        if qty > 99:
+            await q.answer("Max 99 per order.", show_alert=True)
             return
-        await q.answer()
+        if p["stock"] > 0 and qty > p["stock"]:
+            # Going past stock is allowed now (pending mode)
+            await q.answer(f"Note: {p['stock']} in stock, rest will be pending.", show_alert=False)
+        else:
+            await q.answer()
         await render_quantity_view(q, p, qty)
 
     elif action == "dec":
@@ -395,8 +467,9 @@ async def qty_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔢 <b>Enter Quantity</b>\n\n"
             f"Product: <b>{html.escape(p['name'])}</b>\n"
             f"Price: {fmt_price(p['price'])} {CURRENCY}\n"
-            f"Available Stock: {p['stock']}\n\n"
-            f"Send a number between <b>1</b> and <b>{p['stock']}</b>:",
+            f"Stock: {p['stock']}\n\n"
+            f"Send a number between <b>1</b> and <b>99</b>.\n\n"
+            f"💡 If stock is less, extra items become <b>pending</b> for admin.",
             parse_mode="HTML",
         )
 
@@ -428,11 +501,8 @@ async def qty_manual_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if qty < 1:
         qty = 1
-    if qty > p["stock"]:
-        await update.message.reply_text(
-            f"❌ Only <b>{p['stock']}</b> in stock. Send a number between 1 and {p['stock']}:",
-            parse_mode="HTML",
-        )
+    if qty > 99:
+        await update.message.reply_text("❌ Max 99 per order. Send a smaller number:")
         ctx.user_data["qty_manual_pid"] = pid
         ctx.user_data["state"] = "qty_manual"
         return
@@ -442,7 +512,7 @@ async def qty_manual_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# PURCHASE EXECUTION
+# PURCHASE EXECUTION (with pending fallback)
 # ============================================================
 def build_purchase_header(product, qty, total_cost, new_balance):
     header = (
@@ -505,43 +575,191 @@ async def send_purchase_result(q, ctx, product, items, qty, total_cost, new_bala
 
 async def do_purchase(q, ctx, product, qty):
     uid = q.from_user.id
-    try:
-        r = await sb(supabase.rpc("purchase_product_batch", {
-            "p_user_id": uid,
-            "p_product_id": product["id"],
-            "p_quantity": qty,
-        }))
-        result = r.data
-    except Exception as e:
-        log.exception("purchase failed")
-        msg = str(e).lower()
-        if "insufficient_balance" in msg:
-            need = float(product["price"]) * qty
-            await q.answer(
-                f"❌ Insufficient balance. Need {fmt_price(need)} {CURRENCY}.",
-                show_alert=True,
-            )
-            await render_quantity_view(q, product, qty)
-        elif "out_of_stock" in msg:
-            await q.answer("❌ Not enough stock. Reduce quantity.", show_alert=True)
-            await render_quantity_view(q, product, qty)
-        else:
-            await q.answer("❌ Purchase failed. Try again.", show_alert=True)
+    unit_price = float(product["price"])
+    total_needed = unit_price * qty
+    avail = int(product.get("stock", 0))
+
+    user = await get_user(uid)
+    if not user:
+        await q.answer("User not found.", show_alert=True)
+        return
+    balance = float(user["balance"])
+    if balance < total_needed:
+        await q.answer(
+            f"❌ Insufficient balance. Need {fmt_price(total_needed)} {CURRENCY}. "
+            f"Your balance: {fmt_price(balance)} {CURRENCY}.",
+            show_alert=True,
+        )
+        await render_quantity_view(q, product, qty)
         return
 
-    await q.answer("✅ Purchase successful!")
-
-    items = result.get("items", []) or []
-    if isinstance(items, str):
-        import json as _json
+    # ---------- FULL DELIVERY ----------
+    if avail >= qty:
         try:
-            items = _json.loads(items)
-        except Exception:
-            items = [items]
-    new_balance = result.get("new_balance", 0)
-    total_cost = result.get("total_cost", 0)
+            r = await sb(supabase.rpc("purchase_product_batch", {
+                "p_user_id": uid,
+                "p_product_id": product["id"],
+                "p_quantity": qty,
+            }))
+            result = r.data
+        except Exception as e:
+            log.exception("purchase failed")
+            msg = str(e).lower()
+            if "insufficient_balance" in msg:
+                await q.answer(f"❌ Insufficient balance.", show_alert=True)
+                await render_quantity_view(q, product, qty)
+            elif "out_of_stock" in msg:
+                await q.answer("❌ Not enough stock. Try smaller qty.", show_alert=True)
+                await render_quantity_view(q, product, qty)
+            else:
+                await q.answer("❌ Purchase failed. Try again.", show_alert=True)
+            return
 
-    await send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance)
+        await q.answer("✅ Purchase successful!")
+        items = result.get("items", []) or []
+        if isinstance(items, str):
+            import json as _json
+            try:
+                items = _json.loads(items)
+            except Exception:
+                items = [items]
+        new_balance = result.get("new_balance", 0)
+        total_cost = result.get("total_cost", 0)
+        await send_purchase_result(q, ctx, product, items, qty, total_cost, new_balance)
+        return
+
+    # ---------- PARTIAL / FULLY PENDING ----------
+    deliver_qty = min(avail, qty) if avail > 0 else 0
+    pending_qty = qty - deliver_qty
+
+    delivered_items = []
+    delivered_cost = 0.0
+    delivered_balance = balance
+
+    if deliver_qty > 0:
+        try:
+            r = await sb(supabase.rpc("purchase_product_batch", {
+                "p_user_id": uid,
+                "p_product_id": product["id"],
+                "p_quantity": deliver_qty,
+            }))
+            result = r.data
+            raw_items = result.get("items", []) or []
+            if isinstance(raw_items, str):
+                import json as _json
+                try:
+                    raw_items = _json.loads(raw_items)
+                except Exception:
+                    raw_items = [raw_items]
+            delivered_items = raw_items
+            delivered_cost = float(result.get("total_cost", 0))
+            delivered_balance = float(result.get("new_balance", balance))
+        except Exception as e:
+            log.exception("partial delivery failed")
+            deliver_qty = 0
+            pending_qty = qty
+            delivered_items = []
+
+    pending_order = None
+    if pending_qty > 0:
+        try:
+            pending_order = await create_pending_order(uid, product["id"], pending_qty, unit_price)
+        except Exception as e:
+            log.error(f"Pending order create error: {e}")
+
+    await q.answer("⏳ Order processed")
+
+    if deliver_qty > 0 and pending_qty > 0:
+        header = (
+            f"⚠️ <b>Partial Delivery</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 Product: <b>{html.escape(product['name'])}</b>\n"
+            f"🔢 Requested: <b>{qty}</b>\n"
+            f"✅ Delivered: <b>{deliver_qty}</b>\n"
+            f"⏳ Pending: <b>{pending_qty}</b>\n\n"
+            f"💵 Delivered Cost: {fmt_price(delivered_cost)} {CURRENCY}\n"
+            f"💳 Your Balance: {fmt_price(delivered_balance)} {CURRENCY}\n"
+            f"💵 Pending Amount: {fmt_price(pending_qty * unit_price)} {CURRENCY}\n"
+            f"   (charged when admin delivers)\n"
+        )
+        total_items = len(delivered_items)
+        blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(delivered_items, 1)]
+        body = "\n\n".join(["━━━━━━━━━━━━━━━━━━━━━━\n" + b for b in blocks])
+        tail = (
+            f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ <b>{pending_qty} item(s) pending</b>\n"
+            f"Admin has been notified. You'll receive them shortly."
+        )
+        full = header + "\n" + body + tail
+        if len(full) <= 4000:
+            try:
+                await q.edit_message_text(full, parse_mode="HTML")
+            except Exception:
+                try:
+                    await ctx.bot.send_message(uid, full, parse_mode="HTML")
+                except Exception:
+                    pass
+        else:
+            try:
+                await q.edit_message_text(header, parse_mode="HTML")
+            except Exception:
+                try:
+                    await ctx.bot.send_message(uid, header, parse_mode="HTML")
+                except Exception:
+                    pass
+            current = ""
+            for block in blocks:
+                seg = "━━━━━━━━━━━━━━━━━━━━━━\n" + block + "\n\n"
+                if len(current) + len(seg) > 3800:
+                    if current.strip():
+                        try:
+                            await ctx.bot.send_message(uid, current.rstrip(), parse_mode="HTML")
+                        except Exception:
+                            pass
+                    current = seg
+                else:
+                    current += seg
+            if current.strip():
+                try:
+                    await ctx.bot.send_message(uid, current.rstrip(), parse_mode="HTML")
+                except Exception:
+                    pass
+            try:
+                await ctx.bot.send_message(uid, tail, parse_mode="HTML")
+            except Exception:
+                pass
+    else:
+        try:
+            await q.edit_message_text(
+                f"⏳ <b>Order Pending</b>\n\n"
+                f"📦 Product: <b>{html.escape(product['name'])}</b>\n"
+                f"🔢 Quantity: <b>{pending_qty}</b>\n"
+                f"💵 Amount: <b>{fmt_price(pending_qty * unit_price)} {CURRENCY}</b>\n\n"
+                f"❌ Out of stock right now.\n"
+                f"Your order has been forwarded to admin.\n\n"
+                f"💡 You will be charged <b>only when</b> admin delivers.\n"
+                f"Admin will complete it shortly.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    if pending_order:
+        for aid in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(
+                    aid,
+                    f"⏳ <b>New Pending Order</b>\n\n"
+                    f"🆔 Order: <code>#{pending_order['id']}</code>\n"
+                    f"👤 User: <code>{uid}</code>\n"
+                    f"📦 Product: <b>{html.escape(product['name'])}</b>\n"
+                    f"🔢 Quantity: <b>{pending_qty}</b>\n"
+                    f"💵 Amount: <b>{fmt_price(pending_qty * unit_price)} {CURRENCY}</b>\n\n"
+                    f"Go to ⚙️ Admin Panel → ⏳ Pending Orders",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
 
 
 async def noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -846,6 +1064,10 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
     total = total_r.count or 0
     sold = total - unsold
 
+    pending_r = await sb(supabase.table("orders").select("id", count="exact")
+                         .eq("product_id", pid).eq("status", "pending"))
+    pending_cnt = pending_r.count or 0
+
     text = (
         f"📦 <b>{html.escape(p['name'])}</b>\n\n"
         f"🏷️ Category: {html.escape(p['category'])}\n"
@@ -855,6 +1077,7 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
         f"🟢 Available: <b>{unsold}</b>\n"
         f"🔴 Sold: {sold}\n"
         f"📦 Total: {total}\n"
+        f"⏳ Pending Orders: {pending_cnt}\n"
         f"Status: {'✅ Active' if p.get('is_active') else '❌ Inactive'}"
     )
 
@@ -877,6 +1100,319 @@ async def show_admin_product_detail(target, pid: int, is_callback: bool = True):
         await target.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     else:
         await target.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+# ============================================================
+# ADMIN — PENDING ORDERS (NEW)
+# ============================================================
+PENDING_ORDERS_PER_PAGE = 10
+
+
+async def build_pending_orders_list(page: int = 1):
+    r = await sb(supabase.table("orders").select("*").eq("status", "pending").order("id"))
+    orders = r.data or []
+
+    if not orders:
+        kb = [[btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")]]
+        return (
+            "⏳ <b>Pending Orders</b>\n\n✅ No pending orders right now.",
+            InlineKeyboardMarkup(kb),
+        )
+
+    total = len(orders)
+    total_pages = max(1, (total + PENDING_ORDERS_PER_PAGE - 1) // PENDING_ORDERS_PER_PAGE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * PENDING_ORDERS_PER_PAGE
+    page_orders = orders[start:start + PENDING_ORDERS_PER_PAGE]
+
+    uids = list({int(o["user_id"]) for o in page_orders})
+    pids = list({int(o["product_id"]) for o in page_orders})
+    uname_map = await get_usernames_batch(uids)
+
+    product_map = {}
+    if pids:
+        try:
+            pr = await sb(supabase.table("products").select("id,name").in_("id", pids))
+            for p in (pr.data or []):
+                product_map[int(p["id"])] = p["name"]
+        except Exception as e:
+            log.warning(f"product names fetch error: {e}")
+
+    kb = []
+    for o in page_orders:
+        uname = (uname_map.get(int(o["user_id"])) or f"User {o['user_id']}").lstrip("@")
+        if len(uname) > 12:
+            uname = uname[:10] + "…"
+        pname = product_map.get(int(o["product_id"]), "Product")
+        if len(pname) > 12:
+            pname = pname[:10] + "…"
+        kb.append([btn(
+            f"#{o['id']} @{uname} • {pname} x{o['quantity']} • {fmt_price(o['total_price'])} {CURRENCY}",
+            callback_data=f"ord:view:{o['id']}",
+            style="primary",
+        )])
+
+    nav = []
+    if page > 1:
+        nav.append(btn("⬅️ Prev", callback_data=f"ord:list:{page-1}", style="primary"))
+    if total_pages > 1:
+        nav.append(btn(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+    if page < total_pages:
+        nav.append(btn("Next ➡️", callback_data=f"ord:list:{page+1}", style="primary"))
+    if nav:
+        kb.append(nav)
+    kb.append([btn("⬅️ Back to Admin Panel", callback_data="adm:back", style="danger")])
+
+    text = (
+        f"⏳ <b>Pending Orders</b>\n\n"
+        f"📊 Total: <b>{total}</b>  •  Page {page}/{total_pages}\n\n"
+        f"Click an order to manage:"
+    )
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def build_pending_order_detail(order_id: int):
+    r = await sb(supabase.table("orders").select("*").eq("id", order_id).limit(1))
+    if not r.data:
+        return "Order not found.", InlineKeyboardMarkup([[btn("⬅️ Back", callback_data="ord:list:1", style="danger")]])
+    o = r.data[0]
+
+    if o["status"] != "pending":
+        return (
+            f"⚠️ Order #{order_id} is already <b>{html.escape(o['status'])}</b>.",
+            InlineKeyboardMarkup([[btn("⬅️ Back", callback_data="ord:list:1", style="primary")]])
+        )
+
+    uinfo = await get_usernames_batch([int(o["user_id"])])
+    uname = (uinfo.get(int(o["user_id"])) or f"User {o['user_id']}").lstrip("@")
+    user = await get_user(int(o["user_id"]))
+    balance = fmt_price(user["balance"]) if user else "?"
+
+    pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
+    pname = pr.data[0]["name"] if pr.data else "Product"
+
+    text = (
+        f"⏳ <b>Pending Order #{o['id']}</b>\n\n"
+        f"👤 User: <a href=\"tg://user?id={o['user_id']}\">@{html.escape(uname)}</a>\n"
+        f"🆔 ID: <code>{o['user_id']}</code>\n"
+        f"💰 Balance: <code>{balance} {CURRENCY}</code>\n"
+        f"📦 Product: <b>{html.escape(pname)}</b>\n"
+        f"🔢 Quantity: <b>{o['quantity']}</b>\n"
+        f"💵 Amount due: <b>{fmt_price(o['total_price'])} {CURRENCY}</b>\n"
+        f"📅 Created: {(o.get('created_at') or '')[:16].replace('T', ' ')}\n\n"
+        f"Provide items to complete this order:"
+    )
+    kb = [
+        [btn("✅ Fulfill Order", callback_data=f"ord:fulfill:{order_id}", style="success")],
+        [btn("❌ Cancel Order", callback_data=f"ord:cancel:{order_id}", style="danger")],
+        [btn("⬅️ Back to List", callback_data="ord:list:1", style="primary")],
+    ]
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Admin only.", show_alert=True)
+        return
+    data = q.data
+
+    if data.startswith("ord:list:"):
+        try:
+            page = int(data.split(":")[2])
+        except Exception:
+            page = 1
+        await q.answer()
+        text, kb = await build_pending_orders_list(page)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif data.startswith("ord:view:"):
+        oid = int(data.split(":")[2])
+        await q.answer()
+        text, kb = await build_pending_order_detail(oid)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif data.startswith("ord:fulfill:"):
+        oid = int(data.split(":")[2])
+        r = await sb(supabase.table("orders").select("*").eq("id", oid).limit(1))
+        if not r.data:
+            await q.answer("Order not found.", show_alert=True)
+            return
+        o = r.data[0]
+        if o["status"] != "pending":
+            await q.answer("Already processed.", show_alert=True)
+            return
+        ctx.user_data["fulfill_order_id"] = oid
+        ctx.user_data["fulfill_qty"] = int(o["quantity"])
+        ctx.user_data["state"] = "adm_fulfill_order"
+        await q.answer()
+        try:
+            await q.edit_message_text(
+                f"✅ <b>Fulfill Order #{oid}</b>\n\n"
+                f"Send <b>{o['quantity']}</b> item(s), one per line.\n\n"
+                f"Each line = one deliverable item.\n"
+                f"Count must match exactly.\n\n"
+                f"Type /cancel to abort.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("ord:cancel:"):
+        oid = int(data.split(":")[2])
+        await q.answer()
+        kb = InlineKeyboardMarkup([[
+            btn("✅ Confirm Cancel", callback_data=f"ord:rejcancel:{oid}", style="danger"),
+            btn("❌ Keep", callback_data=f"ord:view:{oid}", style="primary"),
+        ]])
+        try:
+            await q.edit_message_text(
+                f"⚠️ <b>Cancel Pending Order #{oid}?</b>\n\n"
+                f"User will <b>NOT</b> be charged.\n"
+                f"The order will be marked cancelled.",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("ord:rejcancel:"):
+        oid = int(data.split(":")[2])
+        await q.answer("Cancelling...")
+        r = await sb(supabase.table("orders").select("*").eq("id", oid).limit(1))
+        if not r.data:
+            await q.answer("Not found.", show_alert=True)
+            return
+        o = r.data[0]
+        if o["status"] != "pending":
+            await q.answer("Already processed.", show_alert=True)
+            return
+        try:
+            await sb(supabase.table("orders").update({"status": "cancelled"}).eq("id", oid))
+        except Exception as e:
+            await q.edit_message_text(f"❌ Error: {html.escape(str(e))}")
+            return
+
+        try:
+            pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
+            pname = pr.data[0]["name"] if pr.data else "Product"
+            await ctx.bot.send_message(
+                o["user_id"],
+                f"❌ <b>Pending Order Cancelled</b>\n\n"
+                f"📦 Product: <b>{html.escape(pname)}</b>\n"
+                f"🔢 Quantity: {o['quantity']}\n"
+                f"💵 Amount: {fmt_price(o['total_price'])} {CURRENCY}\n\n"
+                f"You were <b>NOT</b> charged for this order.\n"
+                f"Please contact support if you need help.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+        await q.answer("Cancelled.", show_alert=False)
+        text, kb = await build_pending_orders_list(1)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+    else:
+        await q.answer()
+
+
+async def adm_btn_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    text, kbd = await build_pending_orders_list(1)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kbd)
+
+
+async def adm_fulfill_order_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    oid = ctx.user_data.pop("fulfill_order_id", None)
+    expected_qty = ctx.user_data.pop("fulfill_qty", 0)
+    ctx.user_data.pop("state", None)
+
+    if not oid:
+        await update.message.reply_text("Session expired.", reply_markup=admin_menu())
+        return
+
+    lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
+    if len(lines) != expected_qty:
+        await update.message.reply_text(
+            f"❌ You provided <b>{len(lines)}</b> items, but this order needs <b>{expected_qty}</b>.\n\n"
+            f"Please send exactly <b>{expected_qty}</b> items (one per line):",
+            parse_mode="HTML",
+        )
+        ctx.user_data["fulfill_order_id"] = oid
+        ctx.user_data["fulfill_qty"] = expected_qty
+        ctx.user_data["state"] = "adm_fulfill_order"
+        return
+
+    ok, result = await complete_pending_order(oid, lines)
+    if not ok:
+        await update.message.reply_text(
+            f"❌ Cannot complete order:\n\n<code>{html.escape(str(result))}</code>",
+            parse_mode="HTML",
+            reply_markup=admin_menu(),
+        )
+        return
+
+    o = result["order"]
+    new_balance = result["new_balance"]
+    items = result["items"]
+    total_items = len(items)
+    blocks = [format_item_block(i, c, total=total_items) for i, c in enumerate(items, 1)]
+    body = "\n\n".join(["━━━━━━━━━━━━━━━━━━━━━━\n" + b for b in blocks])
+
+    pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
+    pname = pr.data[0]["name"] if pr.data else "Product"
+
+    header = (
+        f"✅ <b>Pending Order Completed</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 Order: <code>#{o['id']}</code>\n"
+        f"🛍 Product: <b>{html.escape(pname)}</b>\n"
+        f"🔢 Quantity: <b>{o['quantity']}</b>\n"
+        f"💵 Charged: {fmt_price(o['total_price'])} {CURRENCY}\n"
+        f"💳 Your Balance: {fmt_price(new_balance)} {CURRENCY}\n"
+    )
+    full = header + "\n" + body
+    try:
+        if len(full) <= 4000:
+            await ctx.bot.send_message(o["user_id"], full, parse_mode="HTML")
+        else:
+            await ctx.bot.send_message(o["user_id"], header, parse_mode="HTML")
+            current = ""
+            for block in blocks:
+                seg = "━━━━━━━━━━━━━━━━━━━━━━\n" + block + "\n\n"
+                if len(current) + len(seg) > 3800:
+                    if current.strip():
+                        try:
+                            await ctx.bot.send_message(o["user_id"], current.rstrip(), parse_mode="HTML")
+                        except Exception:
+                            pass
+                    current = seg
+                else:
+                    current += seg
+            if current.strip():
+                try:
+                    await ctx.bot.send_message(o["user_id"], current.rstrip(), parse_mode="HTML")
+                except Exception:
+                    pass
+    except Exception as e:
+        log.error(f"Failed to send fulfilled order: {e}")
+
+    await update.message.reply_text(
+        f"✅ Order <b>#{oid}</b> fulfilled and delivered to user.",
+        parse_mode="HTML",
+        reply_markup=admin_menu(),
+    )
 
 
 # ============================================================
@@ -1452,6 +1988,7 @@ async def adm_btn_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = await sb(supabase.table("users").select("id", count="exact"))
     p = await sb(supabase.table("products").select("id", count="exact").eq("is_active", True))
     o = await sb(supabase.table("orders").select("id", count="exact"))
+    po = await sb(supabase.table("orders").select("id", count="exact").eq("status", "pending"))
     tp = await sb(supabase.table("topup_requests").select("id", count="exact").eq("status", "pending"))
     pm = await sb(supabase.table("payment_methods").select("id", count="exact").eq("is_active", True))
     await update.message.reply_text(
@@ -1459,7 +1996,8 @@ async def adm_btn_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👥 Users: {u.count or 0}\n"
         f"📦 Products: {p.count or 0}\n"
         f"🛒 Orders: {o.count or 0}\n"
-        f"⏳ Pending Topups: {tp.count or 0}\n"
+        f"⏳ Pending Orders: {po.count or 0}\n"
+        f"💳 Pending Topups: {tp.count or 0}\n"
         f"🏦 Active Payment Methods: {pm.count or 0}",
         parse_mode="HTML",
         reply_markup=admin_menu(),
@@ -1769,6 +2307,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await adm_btn_broadcast(update, ctx)
         if text == ADM_TOPUPS:
             return await adm_btn_topups(update, ctx)
+        if text == ADM_ORDERS:
+            return await adm_btn_orders(update, ctx)
         if text == ADM_STATS:
             return await adm_btn_stats(update, ctx)
         if text == ADM_PAYMENTS:
@@ -1821,6 +2361,8 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await adm_broadcast_handler(update, ctx)
     if state == "adm_topup_reject":
         return await adm_topup_reject_reason_handler(update, ctx)
+    if state == "adm_fulfill_order":
+        return await adm_fulfill_order_handler(update, ctx)
     if state == "pm_new_name":
         return await pm_new_name_handler(update, ctx)
     if state == "pm_new_number":
@@ -1870,6 +2412,7 @@ async def main():
 
     app.add_handler(CallbackQueryHandler(topup_pick_callback, pattern="^tp:pick:"))
     app.add_handler(CallbackQueryHandler(adm_topup_action, pattern="^tup:"))
+    app.add_handler(CallbackQueryHandler(ord_callback, pattern="^ord:"))
     app.add_handler(CallbackQueryHandler(pm_callback, pattern="^pm:"))
     app.add_handler(CallbackQueryHandler(adm_callback, pattern="^adm:"))
 
