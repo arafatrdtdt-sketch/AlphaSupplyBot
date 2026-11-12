@@ -98,16 +98,6 @@ def parse_proxy_item(content: str):
 
 
 def format_item_block(idx: int, content: str, total: int = 1, category: str = "") -> str:
-    """
-    Auto-format any deliverable based on content + product category.
-
-    Formats:
-      1) Proxy:  server:port:username:password        (port numeric)
-      2) VPN:    username/email:password:key          (3+ parts)
-                 username/email:password              (2 parts, non-mail category)
-      3) Email:  address:password                     (2 parts, mail category)
-      4) Fallback: raw text
-    """
     content = (content or "").strip()
     if not content:
         return ""
@@ -392,7 +382,7 @@ async def cat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for p in products:
         in_stock = p["stock"] > 0
-        emoji = "" if in_stock else ""
+        emoji = "🟢" if in_stock else "🔴"
         kb.append([btn(
             f"{emoji} {p['name']} — {p['price']} {CURRENCY}",
             callback_data=f"prod:{p['id']}",
@@ -431,8 +421,6 @@ def build_quantity_view(product, qty):
     total = float(product["price"]) * qty
 
     stock_line = f"📦 Stock: {product['stock']}"
-    if product["stock"] <= 0:
-        stock_line += " (⏳ Pending mode — admin will deliver)"
 
     text = (
         f"🛒 <b>{html.escape(product['name'])}</b>\n\n"
@@ -1368,7 +1356,10 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Send <b>{o['quantity']}</b> item(s), one per line.\n\n"
                 f"Each line = one deliverable item.\n"
                 f"Count must match exactly.\n\n"
-                f"💡 No balance will be deducted — already charged at order time.\n\n"
+                f"📝 <b>Format examples:</b>\n"
+                f"• Proxy: <code>server:port:user:pass</code>\n"
+                f"• VPN: <code>user:pass:key</code> or <code>user:pass</code>\n"
+                f"• Email: <code>address:password</code>\n\n"
                 f"Type /cancel to abort.",
                 parse_mode="HTML",
             )
@@ -1500,7 +1491,6 @@ async def adm_fulfill_order_handler(update: Update, ctx: ContextTypes.DEFAULT_TY
     new_balance = result["new_balance"]
     items = result["items"]
 
-    # Fetch product category to pick format
     pr = await sb(supabase.table("products").select("name,category").eq("id", o["product_id"]).limit(1))
     if pr.data:
         pname = pr.data[0].get("name", "Product")
