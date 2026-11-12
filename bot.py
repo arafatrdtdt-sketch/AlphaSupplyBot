@@ -196,7 +196,6 @@ async def create_pending_order(user_id, product_id, qty, unit_price):
 
 
 async def deduct_balance_atomic(user_id, amount):
-    """Deduct balance and return new balance. Returns (success, new_balance)."""
     user = await get_user(user_id)
     if not user:
         return False, 0.0
@@ -230,7 +229,6 @@ async def complete_pending_order(order_id, items):
     if not user:
         return False, "User not found"
 
-    # Balance was already deducted at order placement - do NOT deduct again
     current_balance = float(user["balance"])
 
     items_text = "\n".join(items)
@@ -503,7 +501,7 @@ async def qty_manual_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# PURCHASE EXECUTION (balance deducted UPFRONT for pending)
+# PURCHASE EXECUTION
 # ============================================================
 def build_purchase_header(product, qty, total_cost, new_balance):
     header = (
@@ -647,14 +645,12 @@ async def do_purchase(q, ctx, product, qty):
             delivered_balance = float(result.get("new_balance", balance))
         except Exception as e:
             log.exception("partial delivery failed")
-            # If RPC failed, fall back to full-pending path
             deliver_qty = 0
             pending_qty = qty
             delivered_items = []
             delivered_cost = 0.0
             delivered_balance = balance
 
-    # Deduct pending amount upfront
     pending_cost = pending_qty * unit_price
     pending_order = None
     final_balance = delivered_balance
@@ -662,11 +658,8 @@ async def do_purchase(q, ctx, product, qty):
     if pending_qty > 0 and pending_cost > 0:
         ok, final_balance = await deduct_balance_atomic(uid, pending_cost)
         if not ok:
-            # Something wrong: balance check earlier passed but not now?
-            # Rollback full-delivered portion if any
             log.error(f"Pending deduction failed for user {uid}, need {pending_cost}")
             if deliver_qty > 0:
-                # Refund delivered portion so user isn't charged incorrectly
                 await refund_balance(uid, delivered_cost)
             await q.answer(
                 "❌ Insufficient balance to place order. Please try again.",
@@ -679,14 +672,12 @@ async def do_purchase(q, ctx, product, qty):
             pending_order = await create_pending_order(uid, product["id"], pending_qty, unit_price)
         except Exception as e:
             log.error(f"Pending order create error: {e}")
-            # Refund pending cost since order wasn't created
             await refund_balance(uid, pending_cost)
             final_balance = final_balance + pending_cost
             await q.answer("❌ Order failed. Please try again.", show_alert=True)
             await render_quantity_view(q, product, qty)
             return
 
-        # Insert transaction record for the pending portion (balance already deducted)
         if pending_order:
             try:
                 await sb(supabase.table("transactions").insert({
@@ -720,8 +711,7 @@ async def do_purchase(q, ctx, product, qty):
         tail = (
             f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>{pending_qty} item(s) pending</b>\n"
-            f"Admin has been notified. You'll receive them shortly.\n"
-            f"💡 If admin cancels, the pending amount will be <b>refunded</b> to your balance."
+            f"Admin has been notified. You'll receive them shortly."
         )
         full = header + "\n" + body + tail
         if len(full) <= 4000:
@@ -769,15 +759,20 @@ async def do_purchase(q, ctx, product, qty):
                 f"🔢 Quantity: <b>{pending_qty}</b>\n"
                 f"💵 Amount: <b>{fmt_price(pending_cost)} {CURRENCY}</b>\n\n"
                 f"❌ Out of stock right now.\n"
-                f"Your order has been forwarded to admin.\n\n"
-                f"💡 <b>{fmt_price(pending_cost)} {CURRENCY}</b> already charged.\n"
-                f"If admin <b>cancels</b>, full amount will be <b>refunded</b>.",
+                f"Your order has been forwarded to admin.",
                 parse_mode="HTML",
             )
         except Exception:
             pass
 
     if pending_order:
+        kb_view = InlineKeyboardMarkup([[
+            btn(
+                f"👁 View & Manage Order #{pending_order['id']}",
+                callback_data=f"ord:view:{pending_order['id']}",
+                style="success",
+            ),
+        ]])
         for aid in ADMIN_IDS:
             try:
                 await ctx.bot.send_message(
@@ -787,9 +782,9 @@ async def do_purchase(q, ctx, product, qty):
                     f"👤 User: <code>{uid}</code>\n"
                     f"📦 Product: <b>{html.escape(product['name'])}</b>\n"
                     f"🔢 Quantity: <b>{pending_qty}</b>\n"
-                    f"💵 Amount: <b>{fmt_price(pending_cost)} {CURRENCY}</b> (already charged)\n\n"
-                    f"Go to ⚙️ Admin Panel → ⏳ Pending Orders",
+                    f"💵 Amount: <b>{fmt_price(pending_cost)} {CURRENCY}</b> (already charged)",
                     parse_mode="HTML",
+                    reply_markup=kb_view,
                 )
             except Exception:
                 pass
@@ -1015,11 +1010,19 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if pm_name:
         full_data["payment_method_name"] = pm_name
 
+    tid = None
     try:
-        await sb(supabase.table("topup_requests").insert(full_data))
+        r = await sb(supabase.table("topup_requests").insert(full_data))
+        if r.data:
+            tid = r.data[0]["id"]
     except Exception as e:
         log.warning(f"topup insert with pm info failed: {e}, retrying minimal")
-        await sb(supabase.table("topup_requests").insert(base_data))
+        try:
+            r = await sb(supabase.table("topup_requests").insert(base_data))
+            if r.data:
+                tid = r.data[0]["id"]
+        except Exception as e2:
+            log.error(f"topup minimal insert failed: {e2}")
 
     method_line = f"🏦 Method: {html.escape(pm_name)}\n" if pm_name else ""
     await update.message.reply_text(
@@ -1032,6 +1035,19 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu(is_admin(uid)),
     )
 
+    if tid:
+        kb_view = InlineKeyboardMarkup([[
+            btn(
+                f"👁 View & Manage Topup #{tid}",
+                callback_data=f"tup:view:{tid}",
+                style="success",
+            ),
+        ]])
+    else:
+        kb_view = InlineKeyboardMarkup([[
+            btn("👁 View Pending Topups", callback_data="tup:page:1", style="primary"),
+        ]])
+
     for aid in ADMIN_IDS:
         try:
             await ctx.bot.send_message(
@@ -1040,9 +1056,9 @@ async def topup_txn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"User: <code>{uid}</code>\n"
                 f"{method_line}"
                 f"Amount: {fmt_price(amt)} {CURRENCY}\n"
-                f"TrxID: <code>{html.escape(txn)}</code>\n\n"
-                f"Go to ⚙️ Admin Panel → 💳 Pending Topups",
+                f"TrxID: <code>{html.escape(txn)}</code>",
                 parse_mode="HTML",
+                reply_markup=kb_view,
             )
         except Exception:
             pass
@@ -1336,11 +1352,9 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"❌ Error: {html.escape(str(e))}")
             return
 
-        # Refund full amount back to user
         refund_amount = float(o["total_price"])
         new_balance = await refund_balance(int(o["user_id"]), refund_amount)
 
-        # Create refund transaction record
         try:
             await sb(supabase.table("transactions").insert({
                 "user_id": o["user_id"],
@@ -1353,7 +1367,6 @@ async def ord_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning(f"refund txn insert failed: {e}")
 
-        # Notify user
         try:
             pr = await sb(supabase.table("products").select("name").eq("id", o["product_id"]).limit(1))
             pname = pr.data[0]["name"] if pr.data else "Product"
